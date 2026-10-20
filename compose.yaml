@@ -15,6 +15,17 @@ x-runtime-environment: &runtime-environment
   DATABASE_WAIT_SECONDS: ${DATABASE_WAIT_SECONDS:-60}
   APPROVAL_AUTOMATION_ENABLED: ${APPROVAL_AUTOMATION_ENABLED:-true}
   APPROVAL_POLICY_PATH: /app/approval-policy.json
+  APPROVAL_MODEL_ENABLED: ${APPROVAL_MODEL_ENABLED:-true}
+  APPROVAL_MODEL: gpt-6-sol
+  APPROVAL_MODEL_REASONING_EFFORT: xhigh
+  APPROVAL_MODEL_URL: ${APPROVAL_MODEL_URL:-http://host.docker.internal:8181}
+  APPROVAL_MODEL_TOKEN_FILE: /run/secrets/model-token
+  APPROVAL_MODEL_TIMEOUT_SECONDS: ${APPROVAL_MODEL_TIMEOUT_SECONDS:-300}
+  ATTENTION_ENABLED: ${ATTENTION_ENABLED:-true}
+  ATTENTION_TIMEOUT_SECONDS: ${ATTENTION_TIMEOUT_SECONDS:-900}
+  ATTENTION_CALL_COOLDOWN_SECONDS: ${ATTENTION_CALL_COOLDOWN_SECONDS:-1800}
+  DMS_SENDER_APP_ID: ${DMS_SENDER_APP_ID:-}
+  DMS_CHAT_ID: ${DMS_CHAT_ID:-}
 
 services:
   app:
@@ -42,6 +53,14 @@ services:
     environment: *runtime-environment
     volumes:
       - ./approval-policy.json:/app/approval-policy.json:ro
+      - type: bind
+        source: ./.data/model-token
+        target: /run/secrets/model-token
+        read_only: true
+        bind:
+          create_host_path: false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - database
       - outbound
@@ -49,12 +68,12 @@ services:
       app:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-m", "app.worker", "--healthcheck"]
+      test: ["CMD", "python", "-m", "app.healthcheck"]
       interval: 20s
       timeout: 10s
       start_period: 70s
       retries: 3
-    stop_grace_period: 120s
+    stop_grace_period: 360s
     restart: unless-stopped
   migrate:
     profiles: [maintenance]

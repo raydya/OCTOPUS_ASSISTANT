@@ -226,6 +226,11 @@ class BackgroundSync:
         )
         priority = case(
             (
+                SyncJob.resource == f"messages:{getattr(self.settings, 'dms_chat_id', '')}"
+                if getattr(self.settings, "dms_sender_app_id", "") else False,
+                0,
+            ),
+            (
                 SyncJob.resource.in_(
                     ["chats", "approvals:1", "approvals:2", "approvals:17", "approvals:18"]
                 ),

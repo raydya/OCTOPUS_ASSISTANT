@@ -1,3 +1,4 @@
+from typing import Literal
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
@@ -27,6 +28,17 @@ class Settings(BaseSettings):
     sync_interval_seconds: int = Field(default=60, ge=30, le=3600)
     approval_automation_enabled: bool = True
     approval_policy_path: str = "approval-policy.json"
+    approval_model_enabled: bool = True
+    approval_model: Literal["gpt-6-sol"] = "gpt-6-sol"
+    approval_model_reasoning_effort: Literal["xhigh"] = "xhigh"
+    approval_model_url: str = "http://host.docker.internal:8181"
+    approval_model_token_file: str = ".data/model-token"
+    approval_model_timeout_seconds: float = Field(default=300, ge=30, le=600)
+    attention_enabled: bool = True
+    attention_timeout_seconds: int = Field(default=900, ge=60, le=86400)
+    attention_call_cooldown_seconds: int = Field(default=1800, ge=300, le=86400)
+    dms_sender_app_id: str = ""
+    dms_chat_id: str = ""
 
     @model_validator(mode="after")
     def validate_settings(self):

@@ -1,3 +1,4 @@
+import json
 import re
 import time
 from datetime import timedelta
@@ -22,6 +23,8 @@ class FeishuClient:
         self.security = security
         self.sessions = sessions
         self.sleep = sleep
+        self._attention_token = None
+        self._attention_token_until = 0
         self.http = httpx.Client(
             base_url=API_BASE,
             timeout=httpx.Timeout(settings.http_timeout_seconds),
@@ -216,6 +219,112 @@ class FeishuClient:
                 **({"page_token": page_token} if page_token else {}),
             },
         )
+
+    def message(self, message_id: str) -> dict:
+        data = self._get(
+            f"/im/v1/messages/{message_id}", {"user_id_type": "open_id"}
+        )
+        rows = data.get("items")
+        matches = [
+            row for row in rows
+            if isinstance(row, dict) and row.get("message_id") == message_id
+        ] if isinstance(rows, list) else []
+        if len(matches) != 1:
+            raise FeishuError("invalid_message_response")
+        return matches[0]
+
+    def message_read_status(self, message_ids: list[str]) -> dict[str, bool | None]:
+        if not 1 <= len(message_ids) <= 50 or len(set(message_ids)) != len(message_ids):
+            raise AppError("invalid_message_ids", "已读查询需要 1–50 个不同消息标识。", 422)
+        body = self._request(
+            "POST", "/im/v1/messages/read_status",
+            headers={"Authorization": f"Bearer {self.access_token()}"},
+            json={"message_ids": message_ids},
+        )
+        data = body.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise FeishuError("invalid_read_status")
+        result = dict.fromkeys(message_ids)
+        seen = set()
+        invalid = data.get("invalid_message_ids", [])
+        if not isinstance(invalid, list):
+            raise FeishuError("invalid_read_status")
+        for row in data["items"]:
+            if not isinstance(row, dict) or row.get("message_id") in seen:
+                raise FeishuError("invalid_read_status")
+            identifier = row.get("message_id")
+            seen.add(identifier)
+            if identifier in result and identifier not in invalid and type(row.get("is_read")) is bool:
+                result[identifier] = row["is_read"]
+        return result
+
+    def _attention_credentials(self):
+        if self._attention_token is None or time.monotonic() >= self._attention_token_until:
+            token = self._token(grant_type="client_credentials")
+            if not isinstance(token.get("scope", ""), str):
+                raise FeishuError("invalid_token_response")
+            self._attention_token = token
+            # Refresh granted scopes promptly after an administrator enables them.
+            self._attention_token_until = time.monotonic() + min(
+                60, max(1, int(token["expires_in"]) - 120)
+            )
+        return self._attention_token
+
+    def attention_permissions(self):
+        granted = set(self._attention_credentials().get("scope", "").split())
+        alternatives = {
+            "im:message:send_as_bot": {"im:message:send_as_bot", "im:message", "im:message:send"},
+            "im:message.urgent:phone": {"im:message.urgent:phone", "im:message.urgent:phone_send"},
+        }
+        missing = [name for name, choices in alternatives.items() if not granted.intersection(choices)]
+        return {"ready": not missing, "missing_scopes": missing}
+
+    def _attention_identity(self):
+        if not self.attention_permissions()["ready"]:
+            raise AppError(
+                "attention_permission_required",
+                "请在飞书后台开通应用身份的发送消息和电话加急权限并发布。", 409,
+            )
+        with self.sessions() as db:
+            account = db.get(Account, 1)
+            if not account:
+                raise AppError("connect_required", "请先连接飞书账号。", 409)
+            return account.open_id, self._attention_credentials()["access_token"]
+
+    def send_self_reminder(self, message: str, uuid: str) -> dict:
+        owner, token = self._attention_identity()
+        if not isinstance(message, str) or not message.strip() or len(message) > 10000:
+            raise AppError("invalid_reminder", "提醒内容无效。", 422)
+        if not isinstance(uuid, str) or not 1 <= len(uuid) <= 50:
+            raise AppError("invalid_reminder", "提醒去重标识无效。", 422)
+        body = self._request(
+            "POST", "/im/v1/messages", params={"receive_id_type": "open_id"},
+            headers={"Authorization": f"Bearer {token}"},
+            json={"receive_id": owner, "msg_type": "text",
+                  "content": json.dumps({"text": message}, ensure_ascii=False), "uuid": uuid},
+        )
+        data = body.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("message_id"), str):
+            raise FeishuError("invalid_reminder_response")
+        if not data["message_id"].startswith("om_"):
+            raise FeishuError("invalid_reminder_response")
+        return data
+
+    def phone_self(self, reminder_message_id: str) -> dict:
+        owner, token = self._attention_identity()
+        if not isinstance(reminder_message_id, str) or not reminder_message_id.startswith("om_"):
+            raise AppError("invalid_reminder", "提醒消息标识无效。", 422)
+        # PATCH is deliberately sent once; the caller persists the attempt first.
+        body = self._request(
+            "PATCH", f"/im/v1/messages/{reminder_message_id}/urgent_phone",
+            params={"user_id_type": "open_id"},
+            headers={"Authorization": f"Bearer {token}"},
+            json={"user_id_list": [owner]},
+        )
+        data = body.get("data")
+        if not isinstance(data, dict) or data.get("invalid_user_id_list") != []:
+            raise FeishuError("phone_recipient_unconfirmed")
+        return data
 
     def tasks(self, topic: str, page_token: str | None) -> dict:
         # User-identity endpoint; /tasks/query is a different, legacy contract.

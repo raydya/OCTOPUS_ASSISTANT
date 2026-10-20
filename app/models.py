@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -78,6 +78,9 @@ class WorkerState(Base):
 
 class Chat(Base):
     __tablename__ = "chats"
+    __table_args__ = (
+        Index("ix_chats_activity_order", text("last_activity_time DESC NULLS LAST"), "chat_id"),
+    )
     chat_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     name: Mapped[str] = mapped_column(Text)
     chat_mode: Mapped[str] = mapped_column(String(32))
@@ -85,10 +88,12 @@ class Chat(Base):
     visible: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     generation: Mapped[str] = mapped_column(String(36))
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_activity_time: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class Message(Base):
     __tablename__ = "messages"
+    __table_args__ = (Index("ix_messages_synced_at_message_id", "synced_at", "message_id"),)
     message_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     chat_id: Mapped[str] = mapped_column(String(128), index=True)
     thread_id: Mapped[str | None] = mapped_column(String(128), index=True)
@@ -161,3 +166,85 @@ class ApprovalReview(Base):
     reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    assessment_id: Mapped[str | None] = mapped_column(String(36))
+    snapshot_hash: Mapped[str | None] = mapped_column(String(64))
+    model_review: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+
+class ModelAssessment(Base):
+    __tablename__ = "model_assessments"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    cache_key: Mapped[str] = mapped_column(String(64), unique=True)
+    task_id: Mapped[str] = mapped_column(String(128), index=True)
+    instance_code: Mapped[str] = mapped_column(String(128))
+    owner_open_id: Mapped[str] = mapped_column(String(128))
+    snapshot_hash: Mapped[str] = mapped_column(String(64))
+    feedback_id: Mapped[str | None] = mapped_column(String(36))
+    model: Mapped[str] = mapped_column(String(64))
+    reasoning_effort: Mapped[str] = mapped_column(String(16))
+    prompt_version: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(24), default="assessing")
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    usage: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ApprovalFeedback(Base):
+    __tablename__ = "approval_feedback"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(128), index=True)
+    assessment_id: Mapped[str] = mapped_column(String(36))
+    snapshot_hash: Mapped[str] = mapped_column(String(64))
+    owner_open_id: Mapped[str] = mapped_column(String(128))
+    action: Mapped[str] = mapped_column(String(16))
+    text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AttentionState(Base):
+    __tablename__ = "attention_states"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_open_id: Mapped[str] = mapped_column(String(128))
+    activated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    discovery_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    discovery_message_id: Mapped[str] = mapped_column(String(128), default="")
+    last_call_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MessageAttention(Base):
+    __tablename__ = "message_attention"
+    message_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    source_type: Mapped[str] = mapped_column(String(16), default="message", server_default="message")
+    source_data: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default="{}")
+    approval_task_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    approval_instance_code: Mapped[str | None] = mapped_column(String(128))
+    approval_assessment_id: Mapped[str | None] = mapped_column(String(36))
+    owner_open_id: Mapped[str] = mapped_column(String(128))
+    chat_id: Mapped[str] = mapped_column(String(128))
+    chat_name: Mapped[str] = mapped_column(Text)
+    text: Mapped[str] = mapped_column(Text)
+    source_created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    source_hash: Mapped[str] = mapped_column(String(64))
+    context_hash: Mapped[str | None] = mapped_column(String(64))
+    assessment_context: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    reasons: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    model_result: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    assessment_cache: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    assessed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reminder_uuid: Mapped[str | None] = mapped_column(String(36))
+    reminder_message_id: Mapped[str | None] = mapped_column(String(128))
+    reminder_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    phone_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    phone_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

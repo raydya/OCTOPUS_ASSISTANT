@@ -12,12 +12,17 @@ from lark_oapi.ws.client import Client, loop
 from lark_oapi.ws.model import ClientConfig
 from sqlalchemy import text, update
 
+from app.approval_model import ApprovalModelClient
 from app.approval_review import ApprovalReviewer
+from app.attention import AttentionService
+from app.attention_model import MessageImportanceClient
 from app.config import Settings
-from app.db import check_database, make_database, wait_for_database
+from app.db import make_database, wait_for_database
 from app.errors import AppError, FeishuError
 from app.events import BackgroundSync, EventInboxHandler, worker_status
 from app.feishu import FeishuClient
+from app.healthcheck import check_health
+from app.model_review import ModelReviewService
 from app.models import WorkerState, utcnow
 from app.security import Security
 from app.sync import SyncService
@@ -79,7 +84,14 @@ async def run(settings):
     feishu = FeishuClient(settings, security, sessions)
     ws_http = FeishuClient(settings, security, sessions)
     approval_http = FeishuClient(settings, security, sessions)
-    reviewer = ApprovalReviewer(settings, sessions, approval_http)
+    attention_http = FeishuClient(settings, security, sessions)
+    attention_model = MessageImportanceClient(settings) if settings.attention_enabled else None
+    attention = AttentionService(settings, sessions, attention_http, attention_model)
+    model_client = ApprovalModelClient(settings) if settings.approval_model_enabled else None
+    reviewer = ApprovalReviewer(
+        settings, sessions, approval_http,
+        model_review=ModelReviewService(settings, sessions, model_client) if model_client else None,
+    )
     sync = BackgroundSync(settings, sessions, feishu, SyncService(settings, sessions, feishu))
     socket = FeishuSocket(settings, ws_http, EventInboxHandler(settings, sessions))
     stopping = asyncio.Event()
@@ -103,8 +115,16 @@ async def run(settings):
             await asyncio.sleep(1)
 
     async def review_approvals():
+        next_model_health = 0
         while not stopping.is_set():
             try:
+                if model_client and time.monotonic() >= next_model_health:
+                    try:
+                        details = await asyncio.to_thread(model_client.health)
+                        worker_status(sessions, "approval_model", "ready", **details)
+                    except AppError as exc:
+                        worker_status(sessions, "approval_model", "error", exc.code)
+                    next_model_health = time.monotonic() + 60
                 if settings.approval_automation_enabled:
                     await asyncio.to_thread(reviewer.tick)
                     worker_status(sessions, "approval_review", "running")
@@ -118,8 +138,38 @@ async def run(settings):
             except TimeoutError:
                 pass
 
+    async def check_attention():
+        next_permissions = 0
+        permissions = {"ready": False, "missing_scopes": []}
+        while not stopping.is_set():
+            try:
+                if settings.attention_enabled:
+                    if time.monotonic() >= next_permissions:
+                        permissions = await asyncio.to_thread(attention_http.attention_permissions)
+                        next_permissions = time.monotonic() + 60
+                    await asyncio.to_thread(attention.tick)
+                    worker_status(
+                        sessions, "attention",
+                        "running" if permissions["ready"] else "blocked_permission",
+                        None if permissions["ready"] else "attention_permission_required",
+                        **permissions, buzz_supported=False,
+                    )
+                else:
+                    worker_status(sessions, "attention", "disabled", buzz_supported=False)
+            except Exception as exc:
+                worker_status(
+                    sessions, "attention", "error",
+                    exc.code if isinstance(exc, AppError) else "attention_error",
+                    **permissions, buzz_supported=False,
+                )
+            try:
+                await asyncio.wait_for(stopping.wait(), timeout=5)
+            except TimeoutError:
+                pass
+
     reconcile_task = asyncio.create_task(reconcile())
     approval_task = asyncio.create_task(review_approvals())
+    attention_task = asyncio.create_task(check_attention())
     ping_task = asyncio.create_task(socket._ping_loop())
     next_connect, retry_delay, heartbeat = 0, 2, 0
     try:
@@ -175,6 +225,7 @@ async def run(settings):
         # Let in-flight API/DB work finish before disposing shared resources.
         await reconcile_task
         await approval_task
+        await attention_task
         await socket._disconnect()
         remaining = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         for task in remaining:
@@ -185,22 +236,11 @@ async def run(settings):
         feishu.close()
         ws_http.close()
         approval_http.close()
-        engine.dispose()
-
-
-def check_health():
-    engine, sessions = make_database(Settings())
-    try:
-        check_database(engine)
-        with sessions() as db:
-            state = db.get(WorkerState, "events")
-            if (
-                not state
-                or state.status == "stopped"
-                or (utcnow() - state.heartbeat_at).total_seconds() > 45
-            ):
-                raise SystemExit(1)
-    finally:
+        attention_http.close()
+        if attention_model:
+            attention_model.close()
+        if model_client:
+            model_client.close()
         engine.dispose()
 
 

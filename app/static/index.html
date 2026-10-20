@@ -23,7 +23,7 @@
         <button class="nav-button" data-view="approvals"><span>审批</span><span id="approval-count" class="nav-count">0</span></button>
         <button class="nav-button" data-view="connection"><span>连接与同步</span><span aria-hidden="true">↗</span></button>
       </nav>
-      <div class="sidebar-foot"><span class="phase">审批核验</span><p>按明确规则检查待审批，<br>需要介入的事项留给你。</p><div id="account-name">尚未连接飞书</div><button id="logout" class="text-button">退出工作台</button></div>
+      <div class="sidebar-foot"><span class="phase">审批核验</span><p>后台持续判断待审批，<br>需要介入时向你提问。</p><div id="account-name">尚未连接飞书</div><button id="logout" class="text-button">退出工作台</button></div>
     </aside>
     <main class="main">
       <header class="topbar"><div><p id="subtitle" class="muted">从最近的对话开始</p><h1 id="page-title">我的对话</h1></div><div class="top-actions"><span id="connection-badge" class="badge">未连接</span><button id="connect" class="primary">连接飞书</button></div></header>
@@ -43,14 +43,27 @@
         </div>
       </section>
       <section id="approvals-view" class="view" hidden>
-        <section id="approval-automation" class="automation-banner" aria-live="polite"><strong id="automation-title">正在读取审批核验状态…</strong><p id="automation-description"></p><p id="automation-permission" class="muted"></p></section>
+        <section id="approval-automation" class="automation-banner" aria-live="polite"><strong id="automation-title">正在读取审批核验状态…</strong><p id="automation-model" class="model-config"></p><p id="automation-description"></p><p id="automation-permission" class="muted"></p></section>
         <div class="section-tools"><div class="tabs" aria-label="审批分类"><button class="active" data-topic="1">待我审批</button><button data-topic="2">我已处理</button><button data-topic="17">未读知会</button><button data-topic="18">已读知会</button></div><div class="actions"><button id="approval-restart" class="text-button" hidden>重新开始</button><button id="sync-approvals">同步审批</button></div></div>
         <p id="approval-sync-note" class="muted sync-note">还没有同步审批</p>
         <div class="split-view"><section class="list-pane" aria-label="审批列表"><div id="approval-list" class="item-list"></div><button id="more-approvals" class="load-more" hidden>加载更多审批</button></section><section class="detail-pane approval-detail" aria-label="审批详情"><div id="approval-detail" class="empty"><span class="empty-icon" aria-hidden="true">☷</span><h2>审批信息，一处查看</h2><p>选择一项审批，查看核验结果、表单与处理记录。</p></div></section></div>
       </section>
       <section id="connection-view" class="view connection-view" hidden>
         <section class="connection-section"><h2>飞书连接</h2><p id="connection-description"></p><dl id="connection-info"></dl><p class="muted">长连接接收已配置且可投递的审批变化和机器人可见的消息事件；个人数据通过用户授权接口定时同步。无需公网地址或回调配置。</p><p class="muted">个人审批“订阅注册成功”只表示用户订阅接口已注册，不代表审批实例事件已实际送达。后台没有实例事件选项时，由任务事件与定时读取补齐。</p><details><summary>查看申请的权限</summary><ul id="scope-list"></ul></details><p class="muted">权限需要在飞书开放平台开通并发布，然后由账号本人授权。组织限制的权限需要管理员开启。</p></section>
-        <section class="connection-section"><div class="section-tools"><h2>审批核验与处理记录</h2><button id="refresh-reviews" class="text-button">刷新核验记录</button></div><p class="muted">记录规则核验、需要介入的原因和提交后的处理结果。只有“已确认通过”表示执行结果已经确认。</p><div id="approval-reviews"></div><p id="review-history-note" class="muted"></p></section>
+        <section class="connection-section attention-section" aria-labelledby="attention-heading">
+          <div class="section-tools"><h2 id="attention-heading">待处理事项电话提醒</h2><button id="refresh-attention" class="text-button">刷新提醒记录</button></div>
+          <div class="attention-status" aria-live="polite"><strong id="attention-status-title">正在读取提醒状态…</strong><p id="attention-model" class="model-config"></p><p id="attention-policy"></p><p id="attention-worker-note" class="muted"></p></div>
+          <p class="muted">飞书审批需要你介入时，从提出问题开始等待。无需判断消息是否已读；补充信息、确认通过、暂缓、在飞书处理审批或在这里点击“停止本次提醒”，都会取消本轮提醒。“停止本次提醒”不会通过或拒绝审批，审批仍需处理。仅打开详情不算回应。</p>
+          <p id="attention-dms-policy" class="muted">正在读取 DMS 审批提醒状态…</p>
+          <p class="muted">重要 @ 消息仅监控启用后收到且应用可见的消息。读到消息就算响应，会停止后续电话提醒；已读不表示事情已经处理完成，也可以在这里标记“已处理”。</p>
+          <p id="attention-approval-policy" class="muted">同一审批任务最多发送一次提醒、提交一次电话请求。尚未发送提醒时，审批内容变化会重新计时；已有提交记录时保留原记录，不重拨。</p>
+          <p id="attention-buzz-note" class="muted">接收别人发给你的 Buzz 的接口尚未确认，当前不监控原始 Buzz。</p>
+          <p id="attention-permission" class="muted">电话加急需要机器人发消息与电话加急权限，并消耗企业额度。</p>
+          <p class="muted">“电话已受理”只表示飞书接受了加急请求，不等于电话已接通；请求结果不明时不会自动重拨。</p>
+          <div id="attention-records" aria-label="待处理事项电话提醒记录"></div>
+          <p id="attention-history-note" class="muted"></p>
+        </section>
+        <section class="connection-section"><div class="section-tools"><h2>审批核验与处理记录</h2><button id="refresh-reviews" class="text-button">刷新核验记录</button></div><p class="muted">记录模型判断、参考依据、需要你回答的问题和处理结果。在“我的审批”中打开单据即可补充信息或作出决定。只有“已确认通过”表示执行结果已经确认。</p><div id="approval-reviews"></div><p id="review-history-note" class="muted"></p></section>
         <section class="connection-section"><div class="section-tools"><h2>最近同步</h2><button id="refresh-runs" class="text-button">刷新记录</button></div><p class="muted">“部分完成”表示还有下一批；回到对应页面点击继续同步即可。</p><div id="sync-runs"></div></section>
       </section>
       <footer>数据保存在你的工作台中。附件暂以消息类型展示，查看内容以最近一次同步为准。</footer>

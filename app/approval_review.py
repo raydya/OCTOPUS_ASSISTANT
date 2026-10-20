@@ -1,8 +1,8 @@
 """Conservative local policy evaluation and durable, single-attempt approval.
 
-Only operator-owned policy files authorize execution. Form text is data and never
-creates rules. A committed submission marker is never cleared or replayed, even
-after a timeout or process crash; subsequent ticks only read its task status.
+Operator-owned rules and bounded model decisions authorize execution. Form text
+is data and never creates rules. A committed submission marker is never cleared
+or replayed, even after a timeout or crash; later ticks only read task status.
 """
 
 import hashlib
@@ -14,6 +14,7 @@ from pathlib import Path
 from sqlalchemy import case, or_, select, text
 
 from app.errors import AppError
+from app.model_review import business_snapshot
 from app.models import Account, ApprovalReview, ApprovalTask, SyncState, utcnow
 
 WRITE_SCOPE = "approval:task:write"
@@ -278,13 +279,15 @@ def review_view(review):
             "task_id", "instance_code", "decision", "execution_status",
             "policy_version", "rule_id", "fingerprint", "reasons", "error_code",
             "created_at", "reviewed_at", "submitted_at", "confirmed_at",
+            "assessment_id", "snapshot_hash", "model_review",
         )
     }
 
 
 class ApprovalReviewer:
-    def __init__(self, settings, sessions, feishu):
+    def __init__(self, settings, sessions, feishu, model_review=None):
         self.settings, self.sessions, self.feishu = settings, sessions, feishu
+        self.model_review = model_review
 
     def tick(self):
         if not getattr(self.settings, "approval_automation_enabled", False):
@@ -390,13 +393,53 @@ class ApprovalReviewer:
                 "最新待办第一页未找到该任务，不能确认其审批资格。"
                 if more else "最新完整待办列表中已无此任务，未提交审批。"
             )
-        else:
+        errors = []
+        if not read_error and pending_found:
             errors = _eligibility_errors(task, detail, task_id, instance_code, open_id)
             if errors:
                 decision, rule_id = "needs_review", None
                 reasons.extend(errors)
+        model_result = None
+        if (
+            self.model_review and decision == "needs_review" and not errors
+            and not read_error and not policy_error and pending_found
+        ):
+            model_result = self.model_review.evaluate(task, detail, open_id)
+            decision = "eligible" if model_result["eligible"] else "needs_review"
+            reasons = [model_result["summary"], *model_result["reasons"]]
+            rule_id = (
+                f"{model_result['source']}:{model_result['assessment_id']}"
+                if decision == "eligible" else None
+            )
+            if decision == "eligible":
+                # A model request may take minutes. Re-read both the live queue
+                # and full detail and bind them to the assessed business input.
+                try:
+                    latest = self.feishu.tasks("1", None)
+                    latest_rows = latest.get("tasks") if isinstance(latest, dict) else None
+                    matches = [
+                        item for item in latest_rows
+                        if isinstance(item, dict) and item.get("task_id") == task_id
+                    ] if isinstance(latest_rows, list) else []
+                    latest_detail = self.feishu.instance(instance_code)
+                    if (
+                        len(matches) != 1 or not isinstance(latest_detail, dict)
+                        or _eligibility_errors(
+                            matches[0], latest_detail, task_id, instance_code, open_id,
+                        )
+                        or business_snapshot(matches[0], latest_detail, open_id)
+                        != model_result["snapshot_hash"]
+                    ):
+                        decision, rule_id = "needs_review", None
+                        reasons.append("模型判断后审批内容或处理资格已变化，等待按最新内容重新判断。")
+                        model_result = {**model_result, "eligible": False, "stale": True}
+                except AppError as exc:
+                    read_error = exc.code
+                    decision, rule_id = "needs_review", None
+                    reasons.append("模型判断后无法再次读取最新状态，未提交审批。")
+                    model_result = {**model_result, "eligible": False, "stale": True}
         execution = "awaiting_review"
-        error_code = read_error or policy_error
+        error_code = read_error or policy_error or (model_result or {}).get("error_code")
         if decision == "not_pending":
             execution = "not_pending"
         elif decision == "eligible" and WRITE_SCOPE not in scopes:
@@ -416,6 +459,10 @@ class ApprovalReviewer:
             # Fetch before adding an incomplete new model: ORM autoflush must
             # never insert an audit row before its required fields are assigned.
             current_account = db.get(Account, 1)
+            feedback_current = (
+                not model_result
+                or self.model_review.feedback_matches(db, task_id, model_result)
+            )
             if row is None:
                 row = ApprovalReview(
                     task_id=task_id, instance_code=instance_code, owner_open_id=open_id,
@@ -428,9 +475,19 @@ class ApprovalReviewer:
             ):
                 decision, execution, rule_id = "needs_review", "awaiting_review", None
                 reasons.append("绑定用户或任务关联已变化，需人工核验。")
+            if (
+                model_result and execution == "submitting"
+                and not feedback_current
+            ):
+                decision, execution, rule_id = "needs_review", "awaiting_review", None
+                reasons.append("本人反馈在判断期间发生变化，等待重新核验。")
+                model_result = {**model_result, "eligible": False, "stale": True}
             row.decision, row.execution_status = decision, execution
             row.policy_version, row.rule_id = policy["version"], rule_id
             row.fingerprint, row.reasons, row.error_code = fingerprint, reasons, error_code
+            row.assessment_id = (model_result or {}).get("assessment_id")
+            row.snapshot_hash = (model_result or {}).get("snapshot_hash")
+            row.model_review = model_result
             row.reviewed_at = utcnow()
             if execution == "submitting":
                 row.submitted_at = utcnow()

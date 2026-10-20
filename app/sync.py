@@ -1,12 +1,25 @@
+import re
 import time
 from uuid import uuid4
 
-from sqlalchemy import select, text, update
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 
 from app.content import message_text, parse_json
 from app.errors import AppError, FeishuError
 from app.models import ApprovalInstance, ApprovalTask, Chat, Message, SyncRun, SyncState, utcnow
+
+
+def message_activity_time(raw: dict) -> int:
+    """Use source timestamps, never the time we happened to fetch a message."""
+    values = [0]
+    for key in ("create_time", "update_time"):
+        value = raw.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[0-9]{1,15}", value):
+            value = int(value)
+        if type(value) is int and 0 < value <= 253402300799999:
+            values.append(value)
+    return max(values)
 
 
 def upsert(db, model, values):
@@ -117,6 +130,21 @@ class SyncService:
                 raise FeishuError("invalid_response")
             for raw in rows:
                 self._store(db, kind, raw, identifier, chat_id, state.generation)
+            if kind in {"messages", "thread"}:
+                latest = max((message_activity_time(raw) for raw in rows), default=0)
+                if latest:
+                    # A historical page or delayed sync must not move a chat backwards.
+                    db.execute(
+                        update(Chat)
+                        .where(
+                            Chat.chat_id == chat_id,
+                            or_(
+                                Chat.last_activity_time.is_(None),
+                                Chat.last_activity_time < latest,
+                            ),
+                        )
+                        .values(last_activity_time=latest)
+                    )
             total += len(rows)
             state.has_more = bool(data.get("has_more", False))
             state.page_token = data.get("page_token") if state.has_more else None

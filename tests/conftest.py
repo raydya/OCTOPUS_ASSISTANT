@@ -30,6 +30,8 @@ def settings(tmp_path):
         sync_page_limit=1,
         app_base_url="http://localhost:8000",
         approval_policy_path=str(policy),
+        approval_model_enabled=False,
+        attention_enabled=False,
     )
 
 

@@ -217,6 +217,33 @@ def test_periodic_personal_sync_does_not_require_bot_events(make_app, settings):
     assert len([r for r in calls if r.url.path.endswith("/subscription")]) == 2
 
 
+def test_dms_private_chat_sync_is_prioritized_without_bypassing_retry_backoff(make_app, settings):
+    settings.dms_sender_app_id, settings.dms_chat_id = "cli_dba", "oc_dba"
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.params["container_id"])
+        return ok({"items": [], "has_more": False})
+
+    app = make_app(handler)
+    with app.state.sessions.begin() as db:
+        for identifier in ("oc_dba", "oc_history"):
+            db.add(Chat(
+                chat_id=identifier, name=identifier, chat_mode="p2p",
+                raw={}, generation="test", visible=True,
+            ))
+            enqueue(db, f"messages:{identifier}")
+        db.get(SyncJob, "messages:oc_history").next_attempt_at = utcnow() - timedelta(hours=1)
+    worker = BackgroundSync(settings, app.state.sessions, app.state.feishu, app.state.sync)
+    worker.run_one_job()
+    assert calls == ["oc_dba"]
+    with app.state.sessions.begin() as db:
+        enqueue(db, "messages:oc_dba")
+        db.get(SyncJob, "messages:oc_dba").next_attempt_at = utcnow() + timedelta(minutes=5)
+    worker.run_one_job()
+    assert calls == ["oc_dba", "oc_history"]
+
+
 def test_live_work_bypasses_history_and_unknown_chat_gets_one_fresh_lookup(make_app, settings):
     calls = []
     pending = {"task_id": "task_pending", "instance_code": "i_pending", "status": "1"}

@@ -1,6 +1,6 @@
 # Octopus Assistant
 
-Python 3.12 + FastAPI + PostgreSQL + Docker 的个人飞书工作台。提供对话和审批读取、持续审批检查，以及按已核验本地规则自动同意审批。自动回复尚未实现。
+Python 3.12 + FastAPI + PostgreSQL + Docker 的个人飞书工作台。提供对话和审批读取、持续模型审批判断，以及需要人工介入的审批、重要 @ 消息未响应后的电话提醒。模型固定为 **`gpt-6-sol`，思考强度 `xhigh`**。自动回复他人尚未实现。
 
 使用 **WebSocket 长连接接收事件 + OAuth 设备授权**，无需配置 HTTP 回调地址、公网域名、内网穿透或飞书授权重定向 URL。
 
@@ -10,6 +10,12 @@ Python 3.12 + FastAPI + PostgreSQL + Docker 的个人飞书工作台。提供对
 
 ```bash
 python3 scripts/setup_env.py
+uv sync --frozen
+.venv/bin/python scripts/setup_model.py
+# macOS: install a background service that starts on user login.
+.venv/bin/python scripts/model_service.py install
+# Other systems: keep this running with your service manager:
+# .venv/bin/python -m app.codex_host
 # Configure DATABASE_URL and MIGRATION_DATABASE_URL, then start local-infra first.
 docker compose --profile maintenance run --rm --build migrate
 docker compose up -d --build app worker
@@ -25,9 +31,10 @@ docker compose up -d --build app worker
 
 | 服务 | 职责 |
 | --- | --- |
-| `app` | 工作台、设备授权、只读数据接口；使用受限运行账号 |
-| `worker` | 主动连接飞书 WSS、接收事件、定时读取个人数据、检查待审批并执行匹配规则；使用同一运行账号 |
+| `app` | 工作台、设备授权、读取接口和人工反馈；使用受限运行账号 |
+| `worker` | 连接飞书 WSS、读取个人数据、调用模型判断待办并执行已满足条件的审批，对超时未响应的待处理事项发起电话提醒；使用同一运行账号 |
 | `migrate` | maintenance profile 下的一次性 Alembic 迁移；仅使用本应用 owner 账号 |
+| 宿主机 `app.codex_host` | 在本机独立运行 Codex 模型服务，复用 ChatGPT 登录，每次请求创建隔离的临时线程 |
 
 共享 PostgreSQL 使用外部内部网络 `local-infra-assistant-db`，服务地址为 `shared-postgres:5432`。本应用独占数据库 `octopus_assistant`，不与 Codex bot 共用数据库或账号。`local-infra` 必须先创建该网络、数据库和权限。
 
@@ -85,7 +92,15 @@ docker compose stop
 
 `APPROVAL_AUTOMATION_ENABLED=true` 时，worker 独立检查待审批。相同任务两次检查至少间隔 60 秒，不受历史消息队列阻塞。工作台的审批列表、详情和连接页会展示判断原因、规则版本、提交与确认结果。
 
-当前使用确定性的本地规则，不调用语言模型。`approval-policy.json` 只读挂载到容器，保存经过业务核验的通过条件；它可能含内部业务内容，已排除 Git 和镜像构建上下文。首次运行 `scripts/setup_env.py` 会从 `approval-policy.example.json` 创建空政策，不覆盖既有文件。规则为空时只检查并列出介入原因，不会自动同意。
+后台固定调用 `gpt-6-sol / xhigh`，不自动切换模型或降低思考强度。审批完整内容、任务身份、本人补充信息版本和提示词版本共同决定缓存；相同内容复用已保存结果，内容变化才重新判断。模型只返回结构化判断、理由、问题和引用依据，不持有飞书凭证或审批工具。
+
+模型可以建议低风险且依据完整的申请通过。涉及资金、合同、人事、生产变更、破坏性操作、敏感权限或未读取附件时，程序要求本人介入。模型出错、证据无法核对或读取状态失败时保留待办；单个输入最多自动尝试三次并退避。工作台“审批”详情中会展示问题和依据，可以“提交补充信息”让模型继续判断、“确认通过”授权当前单据，或“暂不处理”。本人同意仅绑定当前任务及完整内容快照，不扩展到其他单据；暂缓后等待新的本人指示。
+
+在宿主机安装并登录 Codex CLI **0.163.0**，运行 `.venv/bin/python scripts/setup_model.py`，再保持 `.venv/bin/python -m app.codex_host` 运行。服务会校验此版本的隔离协议，升级 CLI 后需要重新验证。模型服务默认监听本机 `8181`，Docker worker 使用 `host.docker.internal:8181` 访问。`APPROVAL_MODEL_ENABLED=false` 可以停用模型判断。设置脚本只在 `.data/` 创建私有运行目录和服务令牌，并链接本机已有的 Codex 登录凭证；不修改全局 Codex 配置。模型线程无环境访问，不加载用户技能、MCP 或项目指令；模型请求工具执行时直接失败。服务令牌只读挂载到 worker，登录凭证不进入容器或镜像。
+
+macOS 可用 `scripts/model_service.py install` 注册独立的当前用户 LaunchAgent，服务退出后自动恢复，用户登录时启动；`status` 查看进程，`stop` 停止并取消自动启动。Docker Desktop 和本机需要保持运行。模型服务、ChatGPT 登录或指定型号不可用时，不切换其他型号，工作台保留待处理状态。
+
+`approval-policy.json` 仍可保存经过业务核验的精确通过条件，优先于模型。它只读挂载到容器，已排除 Git 和镜像构建上下文。首次运行 `scripts/setup_env.py` 会创建空政策，不覆盖既有文件。已核验规则和模型评估、人工反馈、实际执行结果分别保存在审计记录中。
 
 规则完整匹配审批定义、表单字段 ID、名称、类型和允许值；未知定义、新增字段、不可解析表单或多个规则同时匹配，均保留待办。表单说明和评论只作为数据，不能修改政策或授予操作权限。具体单据授权使用 `task_ids` 和 `instance_codes` 同时限定；不要将某一单据的确认扩展为整个审批类别的无限授权。
 
@@ -110,11 +125,40 @@ docker compose stop
 
 `fields` 必须覆盖全部非说明控件；复选框值若为数组，允许值写为 `[["选项一", "选项二"]]`，不会把数组拆成任意组合。表单精确快照还可以通过 `form_sha256` 限定。政策每轮重读；更改后无需重建镜像，使用替换文件的编辑器时需重建容器以刷新绑定挂载。
 
-实际提交前重新读取飞书待办和详情，确认任务属于绑定用户、节点仍待处理、支持 API 操作且权限齐全。当前只检查最新待办第一页能明确找到的任务；超过第一页的任务保留人工处理，不凭旧缓存提交。只支持“同意”，不自动拒绝或修改审批表单。
+实际提交前读取飞书待办和详情，确认任务属于绑定用户、节点仍待处理、支持 API 操作且权限齐全。模型判断结束后再次读取并比对完整快照；人工反馈也必须通过最新快照检查。当前只检查最新待办第一页能明确找到的任务；超过第一页的任务保留人工处理，不凭旧缓存提交。只支持“同意”，不自动拒绝或修改审批表单。
 
 提交标记先写入 PostgreSQL，再发送一次 `POST /approval/v4/tasks/pass`。请求超时、错误或进程重启后，只回读状态，不自动重试提交。只有同一实例、同一任务、同一用户的任务状态返回 `APPROVED`，才显示“已确认通过”；实例完成或待办消失都不作为通过证据。结果不确定会持续显示“待核实”。
 
 设置 `APPROVAL_AUTOMATION_ENABLED=false` 并重建容器可暂停检查和后续提交；已经发出的请求可能仍会完成。首次增加写权限后需在工作台重新授权。
+
+## 待处理事项电话提醒
+
+`ATTENTION_ENABLED=true` 后，后台统一检查需要本人介入的审批、配置的 DBA DMS 审批卡片和重要 @ 消息，默认全天运行，`ATTENTION_TIMEOUT_SECONDS=900`（15 分钟）。沿用 `gpt-6-sol / xhigh`、现有飞书长连接和定时读取，不增加 HTTP 回调。响应以具体事项的反馈或处理状态为准，不读取工作台活跃度，也不声称能够监控你是否打开了飞书客户端。
+
+**审批介入**：审批模型返回 `needs_human` 后，从首次提出人工介入开始等待。15 分钟后仍无本人反馈、任务仍待本人处理时，才进入电话提醒核验。这类提醒不依赖消息已读状态；仅打开工作台或审批详情不会取消提醒。在审批详情“提交补充信息”“确认通过”“暂不处理”、在飞书处理审批，或在提醒记录中点击“停止本次提醒”，都会取消本轮。“停止本次提醒”不会通过或拒绝审批，审批仍需本人处理。
+
+同一审批任务最多发送一次提醒、提交一次电话请求。尚未发送提醒时，审批快照变化会更新问题并重新计时 15 分钟；尚未提交的审批提醒在服务重启后继续核验，保留原等待期限和全局冷却时间。已经存在发信或电话提交标记时，保留原标记，内容变化或服务重启均不会导致重拨。工作台记录展示审批任务、实例、判断记录、待核验问题、等待起点及本轮响应期限，并可打开对应审批继续处理。
+
+**重要 @ 消息**：后台从首次启用时间起观察已同步会话中**明确 @ 本人**的新消息，调用模型判断是否重要且需要本人及时响应。到期后实时核对原消息、本人已读状态和后续会话，原消息所属话题内的回复也会单独核验。已读、本人在该会话后续发言或工作台点击“已处理”，都会停止升级；“已读”仅作为避免打扰的响应信号，不代表事项已完成。未知已读状态、分页未查全、消息变化或核验失败均不会触发电话。模型判断与电话执行独立，模型没有发信或呼叫工具。
+
+**DBA DMS 卡片**：用 `DMS_SENDER_APP_ID` 和 `DMS_CHAT_ID` 固定可信 DBA 机器人及本人私聊，后台优先同步该会话。明确待处理的卡片从首次发现开始等待 15 分钟；当前仅支持可用的“同意 / 拒绝”按钮组合，不调用模型决定是否通过，不点击按钮或调用 DMS 审批接口。发送提醒前和拨号前都会重新读取原卡片。已完成、已撤销或本人点击“停止本次提醒”会停止提醒；已读和聊天回复不表示审批完成。同一 DMS 任务的重复通知不会重置等待或导致重拨，未提交的提醒在服务重启后保留。卡片模板或状态无法确认时保留待核查记录，不触发电话；处理状态以飞书可读取的 DBA 卡片为依据。
+
+触发时，应用机器人先单聊给**绑定账号本人**发送提醒，再对这条机器人消息调用飞书电话加急，电话打到飞书绑定手机号。接口要求只能加急机器人自己发送的消息，所以不会直接加急别人发来的原消息。电话提醒消耗企业短信/电话加急额度；机器人会话被折叠等飞书端条件可能影响实际触达。[官方电话加急说明](https://open.feishu.cn/document/server-docs/im-v1/buzz-messages/urgent_phone)
+
+应用需在飞书后台开通并发布以下**应用身份权限**：
+
+- `im:message:send_as_bot`：机器人发送提醒给本人。
+- `im:message.urgent:phone`：对提醒发起电话加急。
+
+这两项不是用户 OAuth 权限，不需要追加到 `FEISHU_SCOPES` 或重新进行个人授权。后台通过应用令牌的有效 scope 检查权限；权限不足时，工作台显示缺少的项。本人已读查询使用现有 `im:message:readonly` 用户权限。[官方 CLI 已读状态契约](https://github.com/larksuite/cli/blob/main/skills/lark-im/references/lark-im-message-read-status.md)
+
+审批介入、DMS 卡片和重要 @ 消息共用 `ATTENTION_CALL_COOLDOWN_SECONDS=1800`，本人的任意两次电话尝试至少间隔 30 分钟。同一原消息最多提交一次电话请求。发信和电话请求前先保存提交标记；超时、错误或中途重启后不重复提交。状态“电话已受理”只表示飞书接受请求，不能证明电话已响铃或接听。恢复服务时不补打已经错过期限的旧 @ 消息；未提交的审批和 DMS 提醒会继续实时核验。记录统一保留在“连接与同步 → 待处理事项电话提醒”。
+
+对于 @ 消息，发送提醒前后续讨论发生变化会重新交给模型判断。提醒已经发出后，如果讨论有新进展或最终核验失败，本条电话升级会停止，不再自动补打。
+
+`ATTENTION_ENABLED=false` 并重建容器可以停用三类电话提醒；审批模型的 `APPROVAL_MODEL_ENABLED` 开关不影响消息重要性判断。审批介入提醒复用已有审批模型结论，不为电话提醒另做一次审批判断。
+
+**当前无法可靠监听别人给本人的原生 Buzz。**已核对公开消息接口、事件列表和现有个人消息返回结构，尚未找到接收该类 Buzz 的公开契约，因此工作台明确显示此限制，不把普通消息当作 Buzz。个人 @ 消息通过用户 API 定时读取，实际发现和升级时间会受消息同步队列、模型耗时及飞书接口影响。
 
 ## 长连接和个人数据范围
 
@@ -132,7 +176,7 @@ SDK 处理 WSS 协议、分片与心跳；进程监督重连并限制获取连�
 
 ## 同步、授权和数据保存
 
-- 页面读取本地缓存，并每 10 秒刷新状态。所有业务读取均使用 `user_access_token`；应用令牌只用于长连接连接数检查。
+- 页面读取本地缓存，并每 10 秒刷新状态。个人业务数据使用 `user_access_token` 读取；应用令牌用于长连接连接数、机器人权限检查，以及向本人发出提醒和电话加急。
 - `SYNC_PAGE_LIMIT` 默认 5，控制每批最大页数。数据和分页游标在一个事务提交；失败回滚当前批，已完成批次保留。后台自动续传，有需要也可手动继续或重新开始。
 - 消息按 `message_id` 幂等更新；审批按 `(task_id, topic)` 保存分类。完整同步结束后才隐藏未出现的旧列表成员。待办消失不会被推断为审批通过。
 - 同步任务持久化，可在进程重启后继续；临时错误退避重试。事件去重记录保留 7 天，仅记录事件 ID 和资源标识，不保存事件消息正文。
@@ -152,12 +196,15 @@ SDK 处理 WSS 协议、分片与心跳；进程监督重连并限制获取连�
 | `POST /auth/feishu/poll` | 检查当前浏览器的授权状态；服务器控制实际轮询频率 |
 | `POST /auth/logout` | 退出工作台 |
 | `GET /api/status` | 用户授权、长连接/同步进程状态、队列和分页进度 |
-| `GET /api/chats` | 缓存会话，支持 `q`、`offset`、`limit` |
+| `GET /api/chats` | 缓存会话，按 `last_activity_time`（最新已同步消息的创建/更新时间，毫秒）倒序；无消息时间的会话置后，支持 `q`、`offset`、`limit` |
 | `GET /api/chats/{chat_id}/messages` | 缓存消息，支持 `thread_id`、`offset`、`limit` |
 | `GET /api/approvals?topic=1` | 审批缓存；topic 为 `1/2/17/18` |
 | `GET /api/approvals/{instance_code}` | 已保存的审批详情 |
 | `GET /api/approval-reviews` | 最近审批检查与执行记录，支持 `limit`、`offset` |
 | `GET /api/approval-reviews/{task_id}` | 单个任务的判断依据、提交与确认状态 |
+| `POST /api/approval-reviews/{task_id}/respond` | 提交本人补充、确认或暂缓；包含 `assessment_id`、`snapshot_hash`、`action`（`answer/approve/hold`）和 `text` |
+| `GET /api/attention` | 审批介入、DMS 卡片及重要消息的等待、响应核验和电话提醒记录；`source_type` 区分 `approval` / `dms_card` / `message` |
+| `POST /api/attention/{message_id}/ack` | 以记录的唯一提醒 ID 停止本轮未提交的电话升级；审批记录对应“停止本次提醒”，不会通过或拒绝审批 |
 | `GET /api/sync-runs` | 最近 30 次同步结果 |
 | `POST /api/sync/chats` | 同步或继续会话列表 |
 | `POST /api/sync/messages/{chat_id}` | 消息同步，JSON `{"days":7,"restart":false}` |
@@ -209,4 +256,4 @@ uv run python -m app.worker
 - [官方个人审批事件订阅](https://github.com/larksuite/cli/blob/main/events/approval/register.go)：实例/任务订阅使用用户身份。
 - [官方公开 API 定义](https://open.feishu.cn/api/tools/open/api_definition?protocol=meta&client_version=1.0.97)：审批列表为 `GET /open-apis/approval/v4/tasks`，详情为 `GET /open-apis/approval/v4/instances/detail`，不要替换为旧版 `tasks/query`。
 
-没有消息发送、审批拒绝或面向浏览器的直接审批写接口；自动同意由后台已核验规则触发。
+消息发送仅用于机器人给绑定账号本人的待处理审批及重要消息提醒。浏览器提交人工反馈，后台重新检查状态后执行审批；接口本身不会直接调用飞书同意请求。尚未实现自动回复他人或审批拒绝。

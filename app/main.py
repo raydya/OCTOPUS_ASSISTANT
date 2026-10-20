@@ -17,12 +17,14 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from app.approval_review import policy_summary, review_view
+from app.approval_review import _eligibility_errors, policy_summary, review_view
+from app.attention import AttentionService, attention_view
 from app.config import Settings
 from app.db import DatabaseNotReady, check_database, make_database, wait_for_database
 from app.device_auth import DeviceAuthService
 from app.errors import AppError
 from app.feishu import FeishuClient
+from app.model_review import ModelReviewService, business_snapshot
 from app.models import (
     Account,
     ApprovalInstance,
@@ -33,6 +35,7 @@ from app.models import (
     DeviceAuthorization,
     EventInbox,
     Message,
+    MessageAttention,
     SyncJob,
     SyncRun,
     SyncState,
@@ -55,6 +58,13 @@ class SyncBody(BaseModel):
     restart: bool = False
 
 
+class ApprovalFeedbackBody(BaseModel):
+    assessment_id: str = Field(min_length=1, max_length=36)
+    snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    action: Literal["answer", "approve", "hold"]
+    text: str = Field(default="", max_length=8000)
+
+
 def create_app(settings=None, *, transport=None):
     settings = settings or Settings()
     engine, sessions = make_database(settings)
@@ -62,6 +72,8 @@ def create_app(settings=None, *, transport=None):
     feishu = FeishuClient(settings, security, sessions, transport=transport)
     sync = SyncService(settings, sessions, feishu)
     device_auth = DeviceAuthService(sessions, security, feishu)
+    model_review = ModelReviewService(settings, sessions, provider=None)
+    attention = AttentionService(settings, sessions, feishu, provider=None)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -235,8 +247,14 @@ def create_app(settings=None, *, transport=None):
                         "heartbeat_at": w.heartbeat_at,
                         "details": w.details,
                         # Subscription registration is durable, not a periodic heartbeat.
-                        "stale": w.name == "events"
-                        and (utcnow() - w.heartbeat_at).total_seconds() > 60,
+                        "stale": (
+                            w.name == "events"
+                            and (utcnow() - w.heartbeat_at).total_seconds() > 60
+                        ) or (
+                            w.name in {"approval_model", "approval_review", "attention"}
+                            and (utcnow() - w.heartbeat_at).total_seconds()
+                            > settings.approval_model_timeout_seconds + 120
+                        ),
                     }
                     for w in db.scalars(select(WorkerState))
                 ],
@@ -248,11 +266,35 @@ def create_app(settings=None, *, transport=None):
                     "write_scope_granted": bool(
                         account and "approval:task:write" in account.scope.split()
                     ),
-                    "needs_review": count(
-                        ApprovalReview, ApprovalReview.decision == "needs_review"
+                    "needs_review": db.scalar(
+                        select(func.count()).select_from(ApprovalReview).join(
+                            ApprovalTask, ApprovalTask.task_id == ApprovalReview.task_id
+                        ).where(
+                            ApprovalReview.decision == "needs_review",
+                            ApprovalTask.visible, ApprovalTask.topic == "1",
+                        )
                     ),
+                    "model": {
+                        "enabled": settings.approval_model_enabled,
+                        "model": settings.approval_model,
+                        "reasoning_effort": settings.approval_model_reasoning_effort,
+                    },
                 },
                 "requested_scopes": settings.feishu_scopes.split(),
+                "attention": {
+                    "enabled": settings.attention_enabled,
+                    "timeout_seconds": settings.attention_timeout_seconds,
+                    "call_cooldown_seconds": settings.attention_call_cooldown_seconds,
+                    "quiet_hours": False,
+                    "approval_intervention_enabled": settings.attention_enabled,
+                    "dms_card_supported": attention.dms.configured,
+                    "model": settings.approval_model,
+                    "reasoning_effort": settings.approval_model_reasoning_effort,
+                    "buzz_supported": False,
+                    "required_bot_scopes": [
+                        "im:message:send_as_bot", "im:message.urgent:phone",
+                    ],
+                },
                 "account": {
                     "name": account.name,
                     "open_id": account.open_id,
@@ -293,7 +335,11 @@ def create_app(settings=None, *, transport=None):
             if q:
                 query = query.where(Chat.name.icontains(q, autoescape=True))
             rows = list(
-                db.scalars(query.order_by(Chat.name, Chat.chat_id).offset(offset).limit(limit + 1))
+                db.scalars(
+                    query.order_by(Chat.last_activity_time.desc().nulls_last(), Chat.chat_id)
+                    .offset(offset)
+                    .limit(limit + 1)
+                )
             )
             return page(
                 rows,
@@ -303,6 +349,7 @@ def create_app(settings=None, *, transport=None):
                     "name": c.name,
                     "chat_mode": c.chat_mode,
                     "synced_at": c.synced_at,
+                    "last_activity_time": c.last_activity_time,
                 },
             )
 
@@ -389,6 +436,37 @@ def create_app(settings=None, *, transport=None):
         with sessions() as db:
             return {"data": review_view(db.get(ApprovalReview, task_id))}
 
+    @app.post("/api/approval-reviews/{task_id}/respond", dependencies=[Depends(mutation)])
+    def approval_respond(task_id: str, body: ApprovalFeedbackBody):
+        if not settings.approval_automation_enabled or not settings.approval_model_enabled:
+            raise AppError("approval_model_disabled", "模型审批已暂停，不能提交新的处理指示。", 409)
+        with sessions() as db:
+            review = db.get(ApprovalReview, task_id)
+            account = db.get(Account, 1)
+            if not review or not account or review.owner_open_id != account.open_id:
+                raise AppError("approval_feedback_stale", "该审批记录不可用。", 409)
+            instance_code, owner = review.instance_code, account.open_id
+        # A response grants authority only to a fresh, exact business snapshot.
+        listing = feishu.tasks("1", None)
+        rows = listing.get("tasks") if isinstance(listing, dict) else None
+        matches = [
+            task for task in rows
+            if isinstance(task, dict) and task.get("task_id") == task_id
+        ] if isinstance(rows, list) else []
+        detail = feishu.instance(instance_code)
+        if (
+            len(matches) != 1 or not isinstance(detail, dict)
+            or _eligibility_errors(matches[0], detail, task_id, instance_code, owner)
+        ):
+            raise AppError(
+                "approval_feedback_stale", "最新待办或处理资格已变化，请刷新后查看。", 409
+            )
+        return {"data": model_review.respond(
+            task_id, body.assessment_id, body.snapshot_hash,
+            body.action, text=body.text,
+            current_snapshot=business_snapshot(matches[0], detail, owner),
+        )}
+
     @app.get("/api/approvals/{instance_code}", dependencies=[Depends(authenticated)])
     def instance(instance_code: str):
         with sessions() as db:
@@ -414,6 +492,22 @@ def create_app(settings=None, *, transport=None):
                     )
                 ]
             }
+
+    @app.get("/api/attention", dependencies=[Depends(authenticated)])
+    def attention_records(
+        limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0),
+    ):
+        with sessions() as db:
+            rows = list(db.scalars(
+                select(MessageAttention)
+                .order_by(MessageAttention.updated_at.desc(), MessageAttention.message_id)
+                .offset(offset).limit(limit + 1)
+            ))
+            return page(rows, limit, attention_view)
+
+    @app.post("/api/attention/{message_id}/ack", dependencies=[Depends(mutation)])
+    def attention_ack(message_id: str):
+        return {"data": attention.acknowledge(message_id)}
 
     @app.post("/api/sync/chats", dependencies=[Depends(mutation)])
     def sync_chats(body: SyncBody):
