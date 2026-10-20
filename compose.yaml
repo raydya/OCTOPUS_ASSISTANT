@@ -7,18 +7,22 @@ x-runtime-environment: &runtime-environment
   FEISHU_APP_ID: ${FEISHU_APP_ID:-}
   FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
   FEISHU_ALLOWED_OPEN_ID: ${FEISHU_ALLOWED_OPEN_ID:-}
-  FEISHU_SCOPES: ${FEISHU_SCOPES:-offline_access contact:user.base:readonly im:chat:read im:message:readonly im:message.p2p_msg:get_as_user im:message.group_msg:get_as_user approval:task:read approval:instance:read}
+  FEISHU_SCOPES: ${FEISHU_SCOPES:-offline_access contact:user.base:readonly im:chat:read im:message:readonly im:message.p2p_msg:get_as_user im:message.group_msg:get_as_user approval:task:read approval:instance:read approval:task:write}
   SYNC_PAGE_LIMIT: ${SYNC_PAGE_LIMIT:-5}
   HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS:-15}
   SESSION_HOURS: ${SESSION_HOURS:-24}
   SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-60}
   DATABASE_WAIT_SECONDS: ${DATABASE_WAIT_SECONDS:-60}
+  APPROVAL_AUTOMATION_ENABLED: ${APPROVAL_AUTOMATION_ENABLED:-true}
+  APPROVAL_POLICY_PATH: /app/approval-policy.json
 
 services:
   app:
     build: .
     image: octopus-assistant:local
     environment: *runtime-environment
+    volumes:
+      - ./approval-policy.json:/app/approval-policy.json:ro
     ports:
       - "127.0.0.1:${APP_PORT:-8000}:8000"
     networks:
@@ -36,6 +40,8 @@ services:
     image: octopus-assistant:local
     command: ["python", "-m", "app.worker"]
     environment: *runtime-environment
+    volumes:
+      - ./approval-policy.json:/app/approval-policy.json:ro
     networks:
       - database
       - outbound

@@ -1,7 +1,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { status: null, view: "chats", chat: null, thread: null, topic: "1", chatOffset: 0, messageOffset: 0, approvalOffset: 0, chatRequest: 0, messageRequest: 0, approvalRequest: 0, detailRequest: 0 };
+const state = { status: null, view: "chats", chat: null, thread: null, topic: "1", approval: null, chatOffset: 0, messageOffset: 0, approvalOffset: 0, chatRequest: 0, messageRequest: 0, approvalRequest: 0, detailRequest: 0, reviewRequest: 0, reviewHistoryRequest: 0 };
 let noticeTimer;
 let deviceTimer;
 let deviceExpiresAt = 0;
@@ -101,12 +101,30 @@ async function refreshStatus() {
   $("connection-description").textContent = !s.configured ? "请在 .env 填写 App ID 和 App Secret，然后重启应用。" : s.account ? `已连接 ${s.account.name}。${s.account.can_refresh ? "授权令牌将自动刷新。" : "未获得离线授权，令牌到期后需要重新连接。"}` : "应用凭证已配置，点击右上角连接飞书完成用户授权。";
   const info = $("connection-info");
   info.replaceChildren(el("dt", "接入方式"), el("dd", "WebSocket 长连接 + 设备授权"), el("dt", "个人数据自动同步"), el("dd", `每 ${s.sync_interval_seconds} 秒安排一轮；当前排队 ${s.queued_syncs} 项。`));
-  const workerLabels = { events: "事件连接", sync: "数据同步", subscriptions: "个人审批订阅" };
-  const workerStates = { connected: "在线", connecting: "连接中", reconnecting: "正在重连", remote_connection_busy: "该应用已有其他长连接，请先停止其他接收进程", waiting_authorization: "等待账号授权", not_configured: "等待应用凭证", subscribed: "已订阅", syncing: "同步中", idle: "等待下一轮", error: "需要检查", stopped: "已停止" };
+  const workerLabels = { events: "事件连接", sync: "数据同步", subscriptions: "个人审批订阅", approval_review: "审批自动核验" };
+  const workerStates = { connected: "在线", connecting: "连接中", reconnecting: "正在重连", remote_connection_busy: "该应用已有其他长连接，请先停止其他接收进程", waiting_authorization: "等待账号授权", not_configured: "等待应用凭证", subscribed: "用户订阅注册成功", syncing: "同步中", running: "核验运行中", disabled: "未启用", idle: "等待下一轮", error: "需要检查", stopped: "已停止" };
   for (const worker of s.workers) info.append(el("dt", workerLabels[worker.name] || worker.name), el("dd", `${worker.stale ? "进程心跳超时" : workerStates[worker.status] || worker.status}${worker.error_code ? `（${worker.error_code}）` : ""}`));
   if (s.account) info.append(el("dt", "账号标识"), el("dd", s.account.open_id), el("dt", "当前令牌到期时间"), el("dd", date(s.account.expires_at)));
   $("scope-list").replaceChildren(...s.requested_scopes.map((scope) => el("li", scope)));
+  renderAutomationStatus();
   updateSyncLabels();
+}
+function renderAutomationStatus() {
+  const automation = state.status?.approval_automation;
+  const worker = state.status?.workers.find((w) => w.name === "approval_review");
+  let title = "审批核验状态暂不可用";
+  let description = "请刷新连接状态后查看。";
+  if (automation) {
+    title = !automation.enabled ? "审批自动核验未启用" : worker?.status === "running" ? "审批自动核验运行中" : worker?.status === "error" ? "审批自动核验需要检查" : "审批自动核验已启用";
+    const count = Number(automation.rule_count || 0);
+    description = count === 0 ? "尚未配置已核验的自动通过规则，目前不会自动通过任何审批。后台检查待审批并记录需要你介入的原因。" : `按 ${count} 条明确规则核验；全部条件满足的任务才可自动通过，其余事项保留给你处理。`;
+    if (!automation.enabled) description = count === 0 ? "后台核验已停用；尚未配置自动通过规则，目前不会自动通过任何审批。" : "后台核验已停用，目前不会自动通过审批。";
+    if (automation.needs_review) description += ` 当前 ${automation.needs_review} 项需要介入。`;
+    if (automation.error_code) description += ` 配置状态：${automation.error_code}。`;
+  }
+  $("automation-title").textContent = title;
+  $("automation-description").textContent = description;
+  $("automation-permission").textContent = !automation ? "" : automation.write_scope_granted ? "已获得审批写入授权；有权限不等于符合自动通过条件。" : "尚未获得 approval:task:write 用户权限。可以继续核验，但无法提交自动审批；开通并发布该权限后需重新授权。";
 }
 async function synchronize(path, body, render) {
   const result = await api(path, "POST", body);
@@ -181,8 +199,9 @@ async function loadApprovals(more = false) {
   if (request !== state.approvalRequest) return;
   if (!more) $("approval-list").replaceChildren();
   for (const task of data.items) {
-    const row = el("button", undefined, "list-item");
+    const row = el("button", undefined, `list-item${state.approval?.task_id === task.task_id ? " active" : ""}`);
     row.append(el("span", task.title, "item-label"), el("span", task.initiator_name || "发起人信息未返回", "item-meta"));
+    row.append(reviewBadge(task.review));
     for (const summary of task.summaries.slice(0, 2)) row.append(el("span", `${summary.key}：${summary.value}`, "item-meta"));
     row.onclick = () => {
       document.querySelectorAll("#approval-list .active").forEach((x) => x.classList.remove("active"));
@@ -205,13 +224,56 @@ function fieldList(fields) {
   return dl;
 }
 const statuses = { PENDING: "审批中", APPROVED: "已通过", REJECTED: "已拒绝", CANCELED: "已撤回", DELETED: "已删除" };
+const reviewDecisions = { needs_review: "需要你介入", eligible: "符合规则", not_pending: "已不在待审批中" };
+const reviewExecutions = { awaiting_review: "等待人工处理", blocked_permission: "缺少审批写入权限", submitting: "正在提交", unknown: "执行结果待核实", approved: "已确认通过", failed: "执行失败" };
+function reviewBadge(review) {
+  if (!review) return el("span", "尚未核验", "review-badge neutral");
+  const execution = review.execution_status;
+  const label = ["approved", "submitting", "unknown", "failed", "blocked_permission"].includes(execution) ? reviewExecutions[execution] : reviewDecisions[review.decision] || "核验状态待确认";
+  const tone = execution === "approved" ? "success" : ["unknown", "failed", "blocked_permission"].includes(execution) || review.decision === "needs_review" ? "attention" : "neutral";
+  return el("span", label, `review-badge ${tone}`);
+}
+function reviewContent(review) {
+  const content = el("div", undefined, "review-content");
+  if (!review) {
+    content.append(el("p", "后台尚未记录此任务的核验结果；不会据此自动通过。", "muted"));
+    return content;
+  }
+  content.append(reviewBadge(review));
+  const explanation = { blocked_permission: "规则判断与执行权限分别检查。当前未提交审批。", submitting: "请求正在提交，尚不能视为审批通过。", unknown: "尚无法确认远端执行结果，请先在飞书核对，避免重复处理。", approved: "审批执行结果已确认。", failed: "审批执行失败，详细原因见下方记录。" }[review.execution_status];
+  if (explanation) content.append(el("p", explanation, "review-explanation"));
+  if (review.reasons?.length) {
+    const reasons = el("ul", undefined, "review-reasons");
+    for (const reason of review.reasons) reasons.append(el("li", reason));
+    content.append(reasons);
+  } else if (review.decision === "needs_review") content.append(el("p", "此任务需要人工判断，请结合审批表单与流程处理。", "muted"));
+  const fields = [["核验结论", reviewDecisions[review.decision] || review.decision], ["执行状态", reviewExecutions[review.execution_status] || review.execution_status], ["最近核验", date(review.reviewed_at || review.created_at)], ["规则版本", review.policy_version || "—"]];
+  if (review.rule_id) fields.push(["匹配规则", review.rule_id]);
+  if (review.submitted_at) fields.push(["提交时间", date(review.submitted_at)]);
+  if (review.confirmed_at) fields.push(["结果确认时间", date(review.confirmed_at)]);
+  if (review.error_code) fields.push(["错误代码", review.error_code]);
+  content.append(fieldList(fields));
+  return content;
+}
+async function refreshApprovalReview(task = state.approval, detailRequest = state.detailRequest) {
+  if (!task || detailRequest !== state.detailRequest) return;
+  const request = ++state.reviewRequest;
+  const result = await api(`/api/approval-reviews/${encodeURIComponent(task.task_id)}`);
+  const panel = $("approval-review");
+  if (request !== state.reviewRequest || detailRequest !== state.detailRequest || panel?.dataset.taskId !== String(task.task_id)) return;
+  panel.replaceChildren(el("h3", "自动核验与处理"), reviewContent(result.data));
+}
 function renderApproval(task, result, request) {
   if (request !== state.detailRequest) return;
   const target = $("approval-detail");
   target.className = "";
   const refresh = el("button", "刷新详情", "text-button");
   refresh.onclick = () => busy(refresh, () => openApproval(task));
-  target.replaceChildren(el("h2", task.title), refresh);
+  const review = el("section", undefined, "approval-review");
+  review.id = "approval-review";
+  review.dataset.taskId = String(task.task_id);
+  review.append(el("h3", "自动核验与处理"), el("p", "正在读取最新核验记录…", "muted"));
+  target.replaceChildren(el("h2", task.title), refresh, review);
   if (!result?.data) { target.append(el("p", "详情尚未同步。权限不足或三方审批可能无法通过此接口读取。", "muted")); return; }
   const d = result.data;
   target.append(el("p", `最近读取：${date(result.synced_at)}`, "muted"), fieldList([["审批状态", statuses[d.status] || d.status], ["单据编号", d.serial_number], ["发起时间", date(Number(d.start_time) || 0)]]));
@@ -231,13 +293,37 @@ function renderApproval(task, result, request) {
   target.append(rawDetails(d));
 }
 async function openApproval(task) {
+  state.approval = task;
   const request = ++state.detailRequest;
   const path = `/api/approvals/${encodeURIComponent(task.instance_code)}`;
   const cached = await api(path);
+  if (request !== state.detailRequest) return;
   renderApproval(task, cached, request);
+  await refreshApprovalReview(task, request);
+  if (request !== state.detailRequest) return;
   await api(`/api/sync/instances/${encodeURIComponent(task.instance_code)}`, "POST", {});
   renderApproval(task, await api(path), request);
+  await refreshApprovalReview(task, request);
 }
+async function loadReviewHistory() {
+  const request = ++state.reviewHistoryRequest;
+  const result = await api("/api/approval-reviews?limit=50");
+  if (request !== state.reviewHistoryRequest) return;
+  const expanded = new Set(Array.from(document.querySelectorAll("#approval-reviews details[open]"), (row) => row.dataset.taskId));
+  $("approval-reviews").replaceChildren();
+  for (const review of result.items) {
+    const row = el("details", undefined, "review-history-item");
+    row.dataset.taskId = String(review.task_id);
+    row.open = expanded.has(row.dataset.taskId);
+    const summary = el("summary");
+    summary.append(reviewBadge(review), el("span", `任务 ${review.task_id}`, "review-task"), el("time", date(review.reviewed_at || review.created_at), "muted"));
+    row.append(summary, fieldList([["审批实例", review.instance_code]]), reviewContent(review));
+    $("approval-reviews").append(row);
+  }
+  $("review-history-note").textContent = result.has_more ? "当前显示最近 50 条核验记录。" : "";
+  if (!result.items.length) empty($("approval-reviews"), "尚无审批核验记录", "后台完成待审批检查后，会在这里显示结论与处理结果。");
+}
+async function loadConnectionRecords() { await Promise.all([loadRuns(), loadReviewHistory()]); }
 async function loadRuns() {
   const data = await api("/api/sync-runs");
   $("sync-runs").replaceChildren();
@@ -300,13 +386,13 @@ document.querySelectorAll("[data-view]").forEach((button) => {
     for (const view of ["chats", "approvals", "connection"]) $(`${view}-view`).hidden = view !== state.view;
     const labels = { chats: ["我的对话", "从最近的对话开始"], approvals: ["我的审批", "查看待办、已办和知会"], connection: ["连接与同步", "查看账号授权和数据更新情况"] };
     [$("page-title").textContent, $("subtitle").textContent] = labels[state.view];
-    const action = state.view === "chats" ? loadChats : state.view === "approvals" ? loadApprovals : loadRuns;
+    const action = state.view === "chats" ? loadChats : state.view === "approvals" ? loadApprovals : loadConnectionRecords;
     action().catch((e) => notice(errorMessage(e), true));
   };
 });
 document.querySelectorAll("[data-topic]").forEach((button) => {
   button.onclick = () => {
-    state.topic = button.dataset.topic; state.detailRequest++;
+    state.topic = button.dataset.topic; state.approval = null; state.detailRequest++;
     document.querySelectorAll("[data-topic]").forEach((x) => x.classList.toggle("active", x === button));
     empty($("approval-detail"), "选择一项审批", "查看表单、流程和处理记录。");
     updateSyncLabels(); loadApprovals().catch((e) => notice(errorMessage(e), true));
@@ -325,6 +411,7 @@ $("more-messages").onclick = () => busy($("more-messages"), () => loadMessages(t
 $("more-approvals").onclick = () => busy($("more-approvals"), () => loadApprovals(true));
 $("back-chat").onclick = () => openChat(state.chat).catch((e) => notice(errorMessage(e), true));
 $("refresh-runs").onclick = () => busy($("refresh-runs"), loadRuns);
+$("refresh-reviews").onclick = () => busy($("refresh-reviews"), loadReviewHistory);
 let searchTimer;
 $("chat-search").oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => loadChats().catch((e) => notice(errorMessage(e), true)), 250); };
 
@@ -342,8 +429,9 @@ setInterval(async () => {
     if (state.view === "chats") {
       if (state.chatOffset <= 50) await loadChats();
       if (state.messageOffset <= 50) await loadMessages();
-    } else if (state.view === "approvals" && state.approvalOffset <= 50) await loadApprovals();
-    else if (state.view === "connection") await loadRuns();
+    } else if (state.view === "approvals") {
+      await Promise.all([state.approvalOffset <= 50 ? loadApprovals() : Promise.resolve(), refreshApprovalReview()]);
+    } else if (state.view === "connection") await loadConnectionRecords();
   } catch { /* Show connection failures on the next explicit operation. */ }
   finally { refreshing = false; }
 }, 10000);

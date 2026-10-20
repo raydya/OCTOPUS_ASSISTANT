@@ -1,6 +1,6 @@
 # Octopus Assistant
 
-Python 3.12 + FastAPI + PostgreSQL + Docker 的个人飞书工作台。当前实现对话和审批读取；自动回复、自动审批留待后续版本。
+Python 3.12 + FastAPI + PostgreSQL + Docker 的个人飞书工作台。提供对话和审批读取、持续审批检查，以及按已核验本地规则自动同意审批。自动回复尚未实现。
 
 使用 **WebSocket 长连接接收事件 + OAuth 设备授权**，无需配置 HTTP 回调地址、公网域名、内网穿透或飞书授权重定向 URL。
 
@@ -26,7 +26,7 @@ docker compose up -d --build app worker
 | 服务 | 职责 |
 | --- | --- |
 | `app` | 工作台、设备授权、只读数据接口；使用受限运行账号 |
-| `worker` | 主动连接飞书 WSS、接收事件、订阅个人审批、定时读取个人数据；使用同一运行账号 |
+| `worker` | 主动连接飞书 WSS、接收事件、定时读取个人数据、检查待审批并执行匹配规则；使用同一运行账号 |
 | `migrate` | maintenance profile 下的一次性 Alembic 迁移；仅使用本应用 owner 账号 |
 
 共享 PostgreSQL 使用外部内部网络 `local-infra-assistant-db`，服务地址为 `shared-postgres:5432`。本应用独占数据库 `octopus_assistant`，不与 Codex bot 共用数据库或账号。`local-infra` 必须先创建该网络、数据库和权限。
@@ -54,16 +54,18 @@ docker compose stop
 
 1. 开通下面的用户身份权限，并将本人加入应用可用范围。
 2. 在“事件与回调 → 事件配置”选择**使用长连接接收事件**。应用启动后可建立连接，无需填写请求地址。
-3. 添加所需事件并发布版本。仅在本地注册事件处理器不会替代飞书后台的事件订阅。
+3. 添加后台可选的所需事件并发布版本。仅在本地注册事件处理器不会替代飞书后台的事件订阅；实例状态事件不是应用运行的前提。
 4. 回到工作台完成设备授权。App ID / Secret 只用于应用身份，个人数据仍需本人授权。
 
 | 事件 | 用途 |
 | --- | --- |
 | `im.message.receive_v1` | 机器人可见消息的更新提示；要求机器人能力及相应应用消息读取权限 |
-| `approval.instance.status_changed_v4` | 个人相关审批实例变化 |
+| `approval.instance.status_changed_v4` | 可选增强：个人相关审批实例变化；后台未提供该选项时可跳过 |
 | `approval.task.status_changed_v4` | 个人相关审批任务变化 |
 
 后台进程会用用户令牌调用审批订阅接口，注册 `INVOLVED_APPROVAL`（本人发起或参与的审批）。这与开放平台的事件订阅共同生效；停掉进程不会取消飞书端的审批订阅关系。
+
+`subscriptions=subscribed` 仅表示用户身份的审批订阅 API 注册成功，不代表后台事件配置已生效，也不代表实例事件已经实际送达。实例事件在当前应用后台不可选时，保留任务事件，并由任务变化触发详情读取、定时同步补齐状态；是否已接通某种实时事件，应以实际收到该类型的事件为准。
 
 | 用户身份权限 | 用途 |
 | --- | --- |
@@ -75,14 +77,50 @@ docker compose stop
 | `im:message.group_msg:get_as_user` | 个人群聊消息 |
 | `approval:task:read` | 待办、已办和知会列表；任务变化订阅 |
 | `approval:instance:read` | 审批详情；实例变化订阅 |
+| `approval:task:write` | 按已核验规则同意本人待办；没有此授权时仍可读取和检查 |
 
 工作台按 `.env` 的 `FEISHU_SCOPES` 请求授权。更新权限需要发布应用并重新授权。单聊/群聊及审批的实际可见范围仍由飞书和组织权限决定。首次授权后会固定绑定账号和租户；可提前用 `FEISHU_ALLOWED_OPEN_ID` 限制账号。
+
+## 持续检查与自动审批
+
+`APPROVAL_AUTOMATION_ENABLED=true` 时，worker 独立检查待审批。相同任务两次检查至少间隔 60 秒，不受历史消息队列阻塞。工作台的审批列表、详情和连接页会展示判断原因、规则版本、提交与确认结果。
+
+当前使用确定性的本地规则，不调用语言模型。`approval-policy.json` 只读挂载到容器，保存经过业务核验的通过条件；它可能含内部业务内容，已排除 Git 和镜像构建上下文。首次运行 `scripts/setup_env.py` 会从 `approval-policy.example.json` 创建空政策，不覆盖既有文件。规则为空时只检查并列出介入原因，不会自动同意。
+
+规则完整匹配审批定义、表单字段 ID、名称、类型和允许值；未知定义、新增字段、不可解析表单或多个规则同时匹配，均保留待办。表单说明和评论只作为数据，不能修改政策或授予操作权限。具体单据授权使用 `task_ids` 和 `instance_codes` 同时限定；不要将某一单据的确认扩展为整个审批类别的无限授权。
+
+政策格式（示例标识不对应真实审批，按实际核验结果配置）：
+
+```json
+{
+  "version": "policy-v1",
+  "rules": [{
+    "id": "verified-task",
+    "definition_code": "DEFINITION_CODE",
+    "definition_name": "已核验的审批定义",
+    "task_ids": ["TASK_ID"],
+    "instance_codes": ["INSTANCE_CODE"],
+    "rationale": "记录业务核验依据与授权范围",
+    "fields": {
+      "FIELD_ID": {"name": "环境", "type": "input", "values": ["隔离测试"]}
+    }
+  }]
+}
+```
+
+`fields` 必须覆盖全部非说明控件；复选框值若为数组，允许值写为 `[["选项一", "选项二"]]`，不会把数组拆成任意组合。表单精确快照还可以通过 `form_sha256` 限定。政策每轮重读；更改后无需重建镜像，使用替换文件的编辑器时需重建容器以刷新绑定挂载。
+
+实际提交前重新读取飞书待办和详情，确认任务属于绑定用户、节点仍待处理、支持 API 操作且权限齐全。当前只检查最新待办第一页能明确找到的任务；超过第一页的任务保留人工处理，不凭旧缓存提交。只支持“同意”，不自动拒绝或修改审批表单。
+
+提交标记先写入 PostgreSQL，再发送一次 `POST /approval/v4/tasks/pass`。请求超时、错误或进程重启后，只回读状态，不自动重试提交。只有同一实例、同一任务、同一用户的任务状态返回 `APPROVED`，才显示“已确认通过”；实例完成或待办消失都不作为通过证据。结果不确定会持续显示“待核实”。
+
+设置 `APPROVAL_AUTOMATION_ENABLED=false` 并重建容器可暂停检查和后续提交；已经发出的请求可能仍会完成。首次增加写权限后需在工作台重新授权。
 
 ## 长连接和个人数据范围
 
 飞书 `im.message.receive_v1` 是**机器人身份事件**，不会推送个人账号的所有聊天。因此应用同时采用：
 
-- **长连接事件**：审批状态变化，以及机器人可见的消息变化。先将事件 ID 和资源标识写入 PostgreSQL，提交成功后才应答；重复推送幂等处理。
+- **长连接事件**：已配置且可投递的审批状态事件，以及机器人可见的消息变化。先将事件 ID 和资源标识写入 PostgreSQL，提交成功后才应答；重复推送幂等处理。
 - **个人数据补齐**：默认每 60 秒安排会话、近 7 天消息、已知话题回复及四类审批列表的同步，使用用户令牌读取。`SYNC_INTERVAL_SECONDS` 可调整周期；实际完成时间受数据量、分页及飞书限流影响。
 - **手动历史读取**：可选近 7 / 30 / 90 / 365 天；后台继续已保存的分页进度。话题回复独立分页。
 
@@ -98,6 +136,7 @@ SDK 处理 WSS 协议、分片与心跳；进程监督重连并限制获取连�
 - `SYNC_PAGE_LIMIT` 默认 5，控制每批最大页数。数据和分页游标在一个事务提交；失败回滚当前批，已完成批次保留。后台自动续传，有需要也可手动继续或重新开始。
 - 消息按 `message_id` 幂等更新；审批按 `(task_id, topic)` 保存分类。完整同步结束后才隐藏未出现的旧列表成员。待办消失不会被推断为审批通过。
 - 同步任务持久化，可在进程重启后继续；临时错误退避重试。事件去重记录保留 7 天，仅记录事件 ID 和资源标识，不保存事件消息正文。
+- 会话与审批列表优先完成分页，随后优先处理近 30 分钟消息事件对应的会话和待审批详情，避免新数据排在大量历史任务之后。事件中的未知会话最多额外完整补查一次；失败任务仍遵守退避时间。
 - 设备授权绑定工作台浏览器会话，遵守飞书轮询间隔、`slow_down`、拒绝和过期状态。设备码和换得的令牌加密保存，浏览器只收到授权链接及用户确认码。
 - 用户访问/刷新令牌使用 Fernet 加密，刷新用行锁串行化。消息正文和审批内容存于普通数据库字段及 JSONB，数据库本身并非全库加密。请保留 `TOKEN_ENCRYPTION_KEY`。
 - 退出工作台结束浏览器会话和未完成的设备授权，后台同步继续。停止后台同步可执行 `docker compose stop worker`；撤销用户授权需在飞书账号授权管理中操作。
@@ -117,6 +156,8 @@ SDK 处理 WSS 协议、分片与心跳；进程监督重连并限制获取连�
 | `GET /api/chats/{chat_id}/messages` | 缓存消息，支持 `thread_id`、`offset`、`limit` |
 | `GET /api/approvals?topic=1` | 审批缓存；topic 为 `1/2/17/18` |
 | `GET /api/approvals/{instance_code}` | 已保存的审批详情 |
+| `GET /api/approval-reviews` | 最近审批检查与执行记录，支持 `limit`、`offset` |
+| `GET /api/approval-reviews/{task_id}` | 单个任务的判断依据、提交与确认状态 |
 | `GET /api/sync-runs` | 最近 30 次同步结果 |
 | `POST /api/sync/chats` | 同步或继续会话列表 |
 | `POST /api/sync/messages/{chat_id}` | 消息同步，JSON `{"days":7,"restart":false}` |
@@ -160,7 +201,7 @@ uv run python -m app.worker
 
 ## 结构与接口依据
 
-`device_auth.py` 管理设备授权；`security.py` 管理会话及加密凭证；`feishu.py` 封装只读数据 API 和审批订阅；`events.py` 管理事件收件箱及同步队列；`worker.py` 运行长连接；`sync.py` 负责分页与事务；`main.py` 提供工作台接口。`migrations/` 保存版本化迁移，保留原账号和业务数据。
+`device_auth.py` 管理设备授权；`security.py` 管理会话及加密凭证；`feishu.py` 封装数据 API、审批订阅与单次同意请求；`approval_review.py` 管理政策核验和持久化执行状态；`events.py` 管理事件收件箱及同步队列；`worker.py` 运行长连接和后台检查；`sync.py` 负责分页与事务；`main.py` 提供工作台接口。`migrations/` 保存版本化迁移，保留原账号和业务数据。
 
 - [飞书官方 Python SDK](https://github.com/larksuite/oapi-sdk-python)：当前锁定 `lark-oapi==1.7.5`，SDK 适配器使用的内部接口升级时需重新验证。
 - [官方设备授权实现](https://github.com/larksuite/cli/blob/main/internal/auth/device_flow.go)：设备授权与 `/oauth/v3/token` 轮询、刷新。
@@ -168,4 +209,4 @@ uv run python -m app.worker
 - [官方个人审批事件订阅](https://github.com/larksuite/cli/blob/main/events/approval/register.go)：实例/任务订阅使用用户身份。
 - [官方公开 API 定义](https://open.feishu.cn/api/tools/open/api_definition?protocol=meta&client_version=1.0.97)：审批列表为 `GET /open-apis/approval/v4/tasks`，详情为 `GET /open-apis/approval/v4/instances/detail`，不要替换为旧版 `tasks/query`。
 
-当前没有消息发送或审批通过/拒绝接口。
+没有消息发送、审批拒绝或面向浏览器的直接审批写接口；自动同意由后台已核验规则触发。

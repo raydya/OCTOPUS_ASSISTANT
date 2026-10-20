@@ -143,3 +143,21 @@ class SyncRun(Base):
     error_code: Mapped[str | None] = mapped_column(String(64))
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ApprovalReview(Base):
+    __tablename__ = "approval_reviews"
+    task_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    instance_code: Mapped[str] = mapped_column(String(128), index=True)
+    owner_open_id: Mapped[str] = mapped_column(String(128))
+    decision: Mapped[str] = mapped_column(String(32), default="needs_review")
+    execution_status: Mapped[str] = mapped_column(String(32), default="awaiting_review")
+    policy_version: Mapped[str] = mapped_column(String(128))
+    rule_id: Mapped[str | None] = mapped_column(String(128))
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    reasons: Mapped[list[str]] = mapped_column(JSONB)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

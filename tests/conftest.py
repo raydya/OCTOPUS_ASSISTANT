@@ -15,7 +15,9 @@ from app.models import Base, utcnow
 
 
 @pytest.fixture
-def settings():
+def settings(tmp_path):
+    policy = tmp_path / "approval-policy.json"
+    policy.write_text('{"version":"test-empty","rules":[]}')
     return Settings(
         _env_file=None,
         database_url=os.environ.get(
@@ -27,6 +29,7 @@ def settings():
         feishu_app_secret="test-app-secret",
         sync_page_limit=1,
         app_base_url="http://localhost:8000",
+        approval_policy_path=str(policy),
     )
 
 

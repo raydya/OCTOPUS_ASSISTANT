@@ -8,3 +8,4 @@ __pycache__
 tests
 docs
 .data/
+approval-policy.json

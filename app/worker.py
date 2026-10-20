@@ -12,6 +12,7 @@ from lark_oapi.ws.client import Client, loop
 from lark_oapi.ws.model import ClientConfig
 from sqlalchemy import text, update
 
+from app.approval_review import ApprovalReviewer
 from app.config import Settings
 from app.db import check_database, make_database, wait_for_database
 from app.errors import AppError, FeishuError
@@ -77,6 +78,8 @@ async def run(settings):
     security = Security(settings, sessions)
     feishu = FeishuClient(settings, security, sessions)
     ws_http = FeishuClient(settings, security, sessions)
+    approval_http = FeishuClient(settings, security, sessions)
+    reviewer = ApprovalReviewer(settings, sessions, approval_http)
     sync = BackgroundSync(settings, sessions, feishu, SyncService(settings, sessions, feishu))
     socket = FeishuSocket(settings, ws_http, EventInboxHandler(settings, sessions))
     stopping = asyncio.Event()
@@ -99,7 +102,24 @@ async def run(settings):
                 worker_status(sessions, "sync", "error", "worker_sync_error")
             await asyncio.sleep(1)
 
+    async def review_approvals():
+        while not stopping.is_set():
+            try:
+                if settings.approval_automation_enabled:
+                    await asyncio.to_thread(reviewer.tick)
+                    worker_status(sessions, "approval_review", "running")
+                else:
+                    worker_status(sessions, "approval_review", "disabled")
+            except Exception:
+                # Keep failures isolated from event ingestion and personal sync.
+                worker_status(sessions, "approval_review", "error", "approval_review_error")
+            try:
+                await asyncio.wait_for(stopping.wait(), timeout=5)
+            except TimeoutError:
+                pass
+
     reconcile_task = asyncio.create_task(reconcile())
+    approval_task = asyncio.create_task(review_approvals())
     ping_task = asyncio.create_task(socket._ping_loop())
     next_connect, retry_delay, heartbeat = 0, 2, 0
     try:
@@ -154,6 +174,7 @@ async def run(settings):
         ping_task.cancel()
         # Let in-flight API/DB work finish before disposing shared resources.
         await reconcile_task
+        await approval_task
         await socket._disconnect()
         remaining = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         for task in remaining:
@@ -163,6 +184,7 @@ async def run(settings):
         leader.close()
         feishu.close()
         ws_http.close()
+        approval_http.close()
         engine.dispose()
 
 

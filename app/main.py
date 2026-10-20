@@ -17,6 +17,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from app.approval_review import policy_summary, review_view
 from app.config import Settings
 from app.db import DatabaseNotReady, check_database, make_database, wait_for_database
 from app.device_auth import DeviceAuthService
@@ -25,6 +26,7 @@ from app.feishu import FeishuClient
 from app.models import (
     Account,
     ApprovalInstance,
+    ApprovalReview,
     ApprovalTask,
     BrowserSession,
     Chat,
@@ -240,6 +242,16 @@ def create_app(settings=None, *, transport=None):
                 ],
                 "event_count": count(EventInbox),
                 "queued_syncs": count(SyncJob),
+                "approval_automation": {
+                    "enabled": settings.approval_automation_enabled,
+                    **policy_summary(settings),
+                    "write_scope_granted": bool(
+                        account and "approval:task:write" in account.scope.split()
+                    ),
+                    "needs_review": count(
+                        ApprovalReview, ApprovalReview.decision == "needs_review"
+                    ),
+                },
                 "requested_scopes": settings.feishu_scopes.split(),
                 "account": {
                     "name": account.name,
@@ -352,9 +364,30 @@ def create_app(settings=None, *, transport=None):
                     "status": t.status,
                     "initiator_name": t.initiator_name,
                     "summaries": t.raw.get("summaries", []),
+                    "review": review_view(db.get(ApprovalReview, t.task_id)),
                     "synced_at": t.synced_at,
                 },
             )
+
+    @app.get("/api/approval-reviews", dependencies=[Depends(authenticated)])
+    def approval_reviews(
+        limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)
+    ):
+        with sessions() as db:
+            rows = list(
+                db.scalars(
+                    select(ApprovalReview)
+                    .order_by(ApprovalReview.reviewed_at.desc(), ApprovalReview.task_id)
+                    .offset(offset)
+                    .limit(limit + 1)
+                )
+            )
+            return page(rows, limit, review_view)
+
+    @app.get("/api/approval-reviews/{task_id}", dependencies=[Depends(authenticated)])
+    def approval_review(task_id: str):
+        with sessions() as db:
+            return {"data": review_view(db.get(ApprovalReview, task_id))}
 
     @app.get("/api/approvals/{instance_code}", dependencies=[Depends(authenticated)])
     def instance(instance_code: str):

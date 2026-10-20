@@ -6,6 +6,12 @@ import secrets
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
+policy = root / "approval-policy.json"
+try:
+    with policy.open("x") as output:
+        output.write((root / "approval-policy.example.json").read_text())
+except FileExistsError:
+    pass
 target = root / ".env"
 content = (root / ".env.example").read_text()
 content = content.replace("APP_PASSWORD=\n", f"APP_PASSWORD={secrets.token_urlsafe(24)}\n")

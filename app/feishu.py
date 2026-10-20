@@ -15,7 +15,7 @@ TOKEN_PATH = "https://accounts.feishu.cn/oauth/v3/token"
 
 
 class FeishuClient:
-    """Data reads, OAuth and event subscriptions; no messaging/approval actions."""
+    """User data, subscriptions and narrowly scoped approval submission."""
 
     def __init__(self, settings, security, sessions, transport=None, sleep=time.sleep):
         self.settings = settings
@@ -211,6 +211,7 @@ class FeishuClient:
                 "container_id": container_id,
                 "page_size": 50,
                 "sort_type": "ByCreateTimeDesc",
+                "with_sender_name": "true",
                 **parameters,
                 **({"page_token": page_token} if page_token else {}),
             },
@@ -233,4 +234,24 @@ class FeishuClient:
         return self._get(
             "/approval/v4/instances/detail",
             {"instance_code": instance_code, "locale": "zh-CN", "user_id_type": "open_id"},
+        )
+
+    def approve_task(self, instance_code: str, task_id: str, comment: str):
+        # Refresh before sending. Never retry a write, including an ambiguous
+        # timeout: the reviewer persists submitting before this method is called.
+        token = self.access_token()
+        with self.sessions() as db:
+            account = db.get(Account, 1)
+            if not account or "approval:task:write" not in account.scope.split():
+                raise AppError(
+                    "approval_write_scope_required",
+                    "请开通 approval:task:write 并重新授权后再提交审批。",
+                    409,
+                )
+        # New user-identity API, distinct from legacy /tasks/approve.
+        return self._request(
+            "POST",
+            "/approval/v4/tasks/pass",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"instance_code": instance_code, "task_id": task_id, "comment": comment},
         )

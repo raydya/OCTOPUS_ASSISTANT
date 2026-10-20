@@ -3,7 +3,7 @@
 import json
 from datetime import timedelta
 
-from sqlalchemy import delete, select
+from sqlalchemy import case, delete, select
 from sqlalchemy.dialects.postgresql import insert
 
 from app.errors import AppError
@@ -165,6 +165,10 @@ class BackgroundSync:
                     # Bot-visible chats may not belong to this user. Never copy their content.
                     if chat and chat.visible:
                         enqueue(db, f"messages:{chat_id}", changed=True)
+                    else:
+                        # The current list cursor may predate this chat. Retain a bounded
+                        # lookup hint after acknowledging the event, without importing it.
+                        event.hints = {**event.hints, "chat_lookup_pending": True}
                     enqueue(db, "chats", changed=True)
                 if event.event_type.startswith("approval."):
                     for topic in ("1", "2", "17", "18"):
@@ -176,12 +180,66 @@ class BackgroundSync:
                         enqueue(db, f"instance:{code}", changed=True)
                 event.processed_at = utcnow()
 
+    def finish_chat_lookups(self, db):
+        retry = False
+        for event in db.scalars(
+            select(EventInbox).where(
+                EventInbox.event_type == "im.message.receive_v1",
+                EventInbox.received_at >= utcnow() - timedelta(minutes=30),
+                EventInbox.hints["chat_lookup_pending"].as_boolean().is_(True),
+            )
+        ):
+            hints = dict(event.hints)
+            chat_id = hints["chat_id"]
+            chat = db.get(Chat, chat_id)
+            if chat and chat.visible:
+                enqueue(db, f"messages:{chat_id}", changed=True)
+                hints.pop("chat_lookup_pending")
+            elif not hints.get("chat_lookup_retried"):
+                # One fresh pass after the old cursor finishes catches newly created
+                # chats. Bot-only/inaccessible chats cannot cause an endless rescan.
+                hints["chat_lookup_retried"] = True
+                retry = True
+            else:
+                hints.pop("chat_lookup_pending")
+            event.hints = hints
+        return retry
+
     def run_one_job(self):
+        recent_message = (
+            select(EventInbox.event_id)
+            .where(
+                EventInbox.event_type == "im.message.receive_v1",
+                EventInbox.received_at >= utcnow() - timedelta(minutes=30),
+                SyncJob.resource == "messages:" + EventInbox.hints["chat_id"].as_string(),
+            )
+            .exists()
+        )
+        pending_instance = (
+            select(ApprovalTask.task_id)
+            .where(
+                ApprovalTask.visible,
+                ApprovalTask.topic == "1",
+                SyncJob.resource == "instance:" + ApprovalTask.instance_code,
+            )
+            .exists()
+        )
+        priority = case(
+            (
+                SyncJob.resource.in_(
+                    ["chats", "approvals:1", "approvals:2", "approvals:17", "approvals:18"]
+                ),
+                0,
+            ),
+            (recent_message, 1),
+            (pending_instance, 2),
+            else_=3,
+        )
         with self.sessions() as db:
             job = db.scalar(
                 select(SyncJob)
                 .where(SyncJob.next_attempt_at <= utcnow())
-                .order_by(SyncJob.next_attempt_at, SyncJob.resource)
+                .order_by(priority, SyncJob.next_attempt_at, SyncJob.resource)
                 .limit(1)
             )
             if not job:
@@ -202,7 +260,10 @@ class BackgroundSync:
             return
         with self.sessions.begin() as db:
             current = db.get(SyncJob, job.resource)
-            if result["has_more"] or current.requested_at != job.requested_at:
+            retry_chat_lookup = (
+                job.resource == "chats" and not result["has_more"] and self.finish_chat_lookups(db)
+            )
+            if result["has_more"] or current.requested_at != job.requested_at or retry_chat_lookup:
                 current.next_attempt_at = utcnow() + timedelta(seconds=1)
                 current.attempts, current.error_code = 0, None
             else:

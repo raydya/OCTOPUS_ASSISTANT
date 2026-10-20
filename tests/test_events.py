@@ -9,7 +9,16 @@ from lark_oapi.ws.pb.pbbp2_pb2 import Frame
 from sqlalchemy import func, select
 
 from app.events import BackgroundSync, EventInboxHandler, enqueue
-from app.models import Chat, EventInbox, Message, SyncJob, utcnow
+from app.models import (
+    ApprovalInstance,
+    ApprovalTask,
+    Chat,
+    EventInbox,
+    Message,
+    SyncJob,
+    SyncState,
+    utcnow,
+)
 from app.worker import FeishuSocket
 
 pytestmark = pytest.mark.integration
@@ -206,3 +215,132 @@ def test_periodic_personal_sync_does_not_require_bot_events(make_app, settings):
         assert db.get(Message, "om_personal").text == "我的个人聊天"
     assert all(request.headers["authorization"] == "Bearer user-access" for request in calls)
     assert len([r for r in calls if r.url.path.endswith("/subscription")]) == 2
+
+
+def test_live_work_bypasses_history_and_unknown_chat_gets_one_fresh_lookup(make_app, settings):
+    calls = []
+    pending = {"task_id": "task_pending", "instance_code": "i_pending", "status": "1"}
+
+    def chat(chat_id):
+        return {"chat_id": chat_id, "name": chat_id, "chat_mode": "p2p"}
+
+    def handler(request):
+        assert request.headers["authorization"] == "Bearer user-access"
+        if request.url.path.endswith("/chats"):
+            cursor = request.url.params.get("page_token")
+            calls.append(("chats", cursor))
+            if cursor == "old_first":
+                return ok(
+                    {"items": [chat("oc_history_0")], "has_more": True, "page_token": "old_last"}
+                )
+            if cursor == "old_last":
+                return ok({"items": [], "has_more": False})
+            return ok({"items": [chat("oc_history_0"), chat("oc_mine")], "has_more": False})
+        if request.url.path.endswith("/tasks"):
+            topic = request.url.params["topic"]
+            calls.append(("approvals", topic))
+            return ok({"tasks": [pending] if topic == "1" else [], "has_more": False})
+        if request.url.path.endswith("/messages"):
+            chat_id = request.url.params["container_id"]
+            calls.append(("messages", chat_id))
+            return ok(
+                {
+                    "items": [
+                        {
+                            "message_id": "om_live",
+                            "msg_type": "text",
+                            "body": {"content": '{"text":"new personal message"}'},
+                        }
+                    ]
+                    if chat_id == "oc_mine"
+                    else [],
+                    "has_more": False,
+                }
+            )
+        code = request.url.params["instance_code"]
+        calls.append(("instance", code))
+        assert code == "i_pending", "Historical details must not delay pending approvals"
+        return ok({"instance_code": code, "form": "[]"})
+
+    app = make_app(handler)
+    now = utcnow()
+    with app.state.sessions.begin() as db:
+        for index in range(50):
+            chat_id = f"oc_history_{index}"
+            db.add(Chat(**chat(chat_id), raw={}, generation="old"))
+            db.add(
+                SyncJob(
+                    resource=f"messages:{chat_id}",
+                    next_attempt_at=now - timedelta(minutes=5) + timedelta(seconds=index),
+                )
+            )
+            db.add(
+                SyncJob(
+                    resource=f"instance:history_{index}",
+                    next_attempt_at=now - timedelta(minutes=4) + timedelta(seconds=index),
+                )
+            )
+        db.add(Chat(**chat("oc_retry"), raw={}, generation="old"))
+        db.add(
+            SyncJob(
+                resource="messages:oc_retry",
+                next_attempt_at=now + timedelta(minutes=5),
+                attempts=2,
+                error_code="feishu_network",
+            )
+        )
+        db.add(
+            ApprovalTask(
+                **pending, topic="1", title="pending", initiator_name="", raw={}, generation="old"
+            )
+        )
+        db.add(SyncJob(resource="instance:i_pending", next_attempt_at=now))
+        db.add(
+            SyncState(
+                resource="chats",
+                generation="old",
+                parameters={},
+                page_token="old_first",
+                has_more=True,
+            )
+        )
+        for resource in ["chats", "approvals:1", "approvals:2", "approvals:17", "approvals:18"]:
+            db.add(SyncJob(resource=resource, next_attempt_at=now - timedelta(minutes=1)))
+
+    inbox = EventInboxHandler(settings, app.state.sessions)
+    for event_id, chat_id in [
+        ("new_chat", "oc_mine"),
+        ("bot_only", "oc_bot"),
+        ("retry", "oc_retry"),
+    ]:
+        payload = json.loads(event_payload(event_id))
+        payload["event"]["message"]["chat_id"] = chat_id
+        inbox._do_without_validation(json.dumps(payload).encode())
+    worker = BackgroundSync(settings, app.state.sessions, app.state.feishu, app.state.sync)
+    worker.drain_events()
+
+    for _ in range(3):
+        with app.state.sessions.begin() as db:
+            # Advance only the short page-continuation delay; no sleeping in the test.
+            db.get(SyncJob, "chats").next_attempt_at = now - timedelta(minutes=2)
+        worker.run_one_job()
+    assert calls == [("chats", "old_first"), ("chats", "old_last"), ("chats", None)]
+    with app.state.sessions() as db:
+        assert db.get(SyncJob, "chats") is None  # Invisible bot chat does not loop forever.
+        assert not db.get(EventInbox, "bot_only").hints.get("chat_lookup_pending")
+
+    for _ in range(4):
+        worker.run_one_job()
+    assert {topic for kind, topic in calls[3:]} == {"1", "2", "17", "18"}
+    assert all(kind == "approvals" for kind, _ in calls[3:])
+    worker.run_one_job()
+    worker.run_one_job()
+    assert calls[-2:] == [("messages", "oc_mine"), ("instance", "i_pending")]
+    worker.run_one_job()
+    assert calls[-1] == ("messages", "oc_history_0")  # Ordinary work retains oldest-first order.
+    with app.state.sessions() as db:
+        assert db.get(Message, "om_live").text == "new personal message"
+        assert db.get(ApprovalInstance, "i_pending")
+        retry = db.get(SyncJob, "messages:oc_retry")
+        assert retry.next_attempt_at == now + timedelta(minutes=5)
+        assert retry.attempts == 2  # Recent events never bypass failed-job backoff.
