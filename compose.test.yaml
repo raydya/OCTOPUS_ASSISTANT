@@ -1,0 +1,16 @@
+services:
+  test-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: octopus_test
+      POSTGRES_PASSWORD: test_only
+      POSTGRES_DB: octopus_test
+    ports:
+      - "127.0.0.1:55432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U octopus_test -d octopus_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 20

@@ -1,0 +1,70 @@
+x-runtime-environment: &runtime-environment
+  # Explicit fields keep the migration owner's credential out of app and worker.
+  DATABASE_URL: ${DATABASE_URL:?Configure the shared PG runtime connection in .env}
+  APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8000}
+  APP_PASSWORD: ${APP_PASSWORD:?Run python3 scripts/setup_env.py first}
+  TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?Run python3 scripts/setup_env.py first}
+  FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+  FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+  FEISHU_ALLOWED_OPEN_ID: ${FEISHU_ALLOWED_OPEN_ID:-}
+  FEISHU_SCOPES: ${FEISHU_SCOPES:-offline_access contact:user.base:readonly im:chat:read im:message:readonly im:message.p2p_msg:get_as_user im:message.group_msg:get_as_user approval:task:read approval:instance:read}
+  SYNC_PAGE_LIMIT: ${SYNC_PAGE_LIMIT:-5}
+  HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS:-15}
+  SESSION_HOURS: ${SESSION_HOURS:-24}
+  SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-60}
+  DATABASE_WAIT_SECONDS: ${DATABASE_WAIT_SECONDS:-60}
+
+services:
+  app:
+    build: .
+    image: octopus-assistant:local
+    environment: *runtime-environment
+    ports:
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+    networks:
+      - database
+      - outbound
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 70s
+      retries: 5
+    restart: unless-stopped
+  worker:
+    build: .
+    image: octopus-assistant:local
+    command: ["python", "-m", "app.worker"]
+    environment: *runtime-environment
+    networks:
+      - database
+      - outbound
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.worker", "--healthcheck"]
+      interval: 20s
+      timeout: 10s
+      start_period: 70s
+      retries: 3
+    stop_grace_period: 120s
+    restart: unless-stopped
+  migrate:
+    profiles: [maintenance]
+    build: .
+    image: octopus-assistant:local
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      # Never fall back to the runtime connection for DDL.
+      MIGRATION_DATABASE_URL: ${MIGRATION_DATABASE_URL:-}
+      DATABASE_WAIT_SECONDS: ${DATABASE_WAIT_SECONDS:-60}
+    networks:
+      - database
+    restart: "no"
+
+networks:
+  database:
+    external: true
+    name: local-infra-assistant-db
+  outbound:

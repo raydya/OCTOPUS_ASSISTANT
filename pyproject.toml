@@ -1,0 +1,32 @@
+[project]
+name = "octopus-assistant"
+version = "0.1.0"
+description = "A personal, read-only Feishu inbox and approval workspace"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.34,<1",
+  "sqlalchemy>=2.0,<3",
+  "psycopg[binary]>=3.2,<4",
+  "alembic>=1.14,<2",
+  "httpx>=0.28,<1",
+  "pydantic-settings>=2.7,<3",
+  "cryptography>=44,<48",
+  "lark-oapi==1.7.5",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["integration: requires TEST_DATABASE_URL pointing to an isolated PostgreSQL database"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501", "B008"]
