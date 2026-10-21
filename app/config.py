@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     approval_model_token_file: str = ".data/model-token"
     approval_model_timeout_seconds: float = Field(default=300, ge=30, le=600)
     attention_enabled: bool = True
+    status_notifications_enabled: bool = True
     attention_timeout_seconds: int = Field(default=900, ge=60, le=86400)
     attention_call_cooldown_seconds: int = Field(default=1800, ge=300, le=86400)
     dms_sender_app_id: str = ""

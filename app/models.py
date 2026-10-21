@@ -1,7 +1,17 @@
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, String, Text, text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -246,5 +256,47 @@ class MessageAttention(Base):
     phone_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     phone_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class StatusNotificationState(Base):
+    __tablename__ = "status_notification_states"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_open_id: Mapped[str] = mapped_column(String(128))
+    activated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    discovery_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    discovery_message_id: Mapped[str] = mapped_column(String(128), default="")
+
+
+class StatusNoticeSource(Base):
+    __tablename__ = "status_notice_sources"
+    __table_args__ = (UniqueConstraint("owner_open_id", "source_type", "source_id"),)
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_open_id: Mapped[str] = mapped_column(String(128))
+    source_type: Mapped[str] = mapped_column(String(32))
+    source_id: Mapped[str] = mapped_column(String(128))
+    revision: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    notify_changes: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class StatusNotification(Base):
+    __tablename__ = "status_notifications"
+    __table_args__ = (UniqueConstraint("source_key", "revision"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    source_key: Mapped[str] = mapped_column(String(64), index=True)
+    owner_open_id: Mapped[str] = mapped_column(String(128))
+    revision: Mapped[str] = mapped_column(String(64))
+    phase: Mapped[str] = mapped_column(String(32))
+    text: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    message_id: Mapped[str | None] = mapped_column(String(128))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

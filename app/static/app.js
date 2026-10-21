@@ -104,7 +104,7 @@ async function refreshStatus() {
   $("connection-description").textContent = !s.configured ? "请在 .env 填写 App ID 和 App Secret，然后重启应用。" : s.account ? `已连接 ${s.account.name}。${s.account.can_refresh ? "授权令牌将自动刷新。" : "未获得离线授权，令牌到期后需要重新连接。"}` : "应用凭证已配置，点击右上角连接飞书完成用户授权。";
   const info = $("connection-info");
   info.replaceChildren(el("dt", "接入方式"), el("dd", "WebSocket 长连接 + 设备授权"), el("dt", "个人数据自动同步"), el("dd", `每 ${s.sync_interval_seconds} 秒安排一轮；当前排队 ${s.queued_syncs} 项。`));
-  const workerLabels = { events: "事件连接", sync: "数据同步", subscriptions: "个人审批订阅", approval_review: "审批自动核验", approval_model: "审批模型", attention: "待处理事项电话提醒" };
+  const workerLabels = { events: "事件连接", sync: "数据同步", subscriptions: "个人审批订阅", approval_review: "审批自动核验", approval_model: "审批模型", attention: "待处理事项电话提醒", status_notifications: "即时状态私信" };
   const workerStates = { connected: "在线", connecting: "连接中", reconnecting: "正在重连", remote_connection_busy: "该应用已有其他长连接，请先停止其他接收进程", waiting_authorization: "等待账号授权", not_configured: "等待应用凭证", subscribed: "用户订阅注册成功", syncing: "同步中", running: "核验运行中", ready: "本机运行环境就绪", disabled: "未启用", idle: "等待下一轮", blocked_permission: "等待应用权限开通", error: "需要检查", stopped: "已停止" };
   for (const worker of s.workers) {
     const label = worker.name === "approval_model" ? modelRuntimeLabel(worker) : worker.name === "attention" && worker.status === "running" ? "监控运行中" : workerStates[worker.status] || worker.status;
@@ -114,6 +114,10 @@ async function refreshStatus() {
   $("scope-list").replaceChildren(...s.requested_scopes.map((scope) => el("li", scope)));
   renderAutomationStatus();
   renderAttentionStatus();
+  const notices = s.status_notifications;
+  $("status-notification-policy").textContent = !notices?.enabled
+    ? "即时状态私信未启用。"
+    : `收到新审批、DMS 待办或明确 @ 本人的消息后，机器人直接私信汇报状态与判断，后续重要变化再更新。已发送 ${notices.sent} 条，待发送 ${notices.pending} 条，结果未确认 ${notices.unknown} 条。首次启用不补发历史消息，状态私信不会取消原有 15 分钟电话提醒。`;
   updateSyncLabels();
 }
 function renderAttentionStatus() {

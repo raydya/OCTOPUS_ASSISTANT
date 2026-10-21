@@ -36,6 +36,7 @@ from app.models import (
     EventInbox,
     Message,
     MessageAttention,
+    StatusNotification,
     SyncJob,
     SyncRun,
     SyncState,
@@ -43,6 +44,7 @@ from app.models import (
     utcnow,
 )
 from app.security import COOKIE_NAME, Security
+from app.status_notifications import notification_view
 from app.sync import SyncService, instance_view
 
 STATIC = Path(__file__).parent / "static"
@@ -248,7 +250,7 @@ def create_app(settings=None, *, transport=None):
                         "details": w.details,
                         # Subscription registration is durable, not a periodic heartbeat.
                         "stale": (
-                            w.name == "events"
+                            w.name in {"events", "status_notifications"}
                             and (utcnow() - w.heartbeat_at).total_seconds() > 60
                         ) or (
                             w.name in {"approval_model", "approval_review", "attention"}
@@ -260,6 +262,12 @@ def create_app(settings=None, *, transport=None):
                 ],
                 "event_count": count(EventInbox),
                 "queued_syncs": count(SyncJob),
+                "status_notifications": {
+                    "enabled": settings.status_notifications_enabled,
+                    "sent": count(StatusNotification, StatusNotification.status == "sent", StatusNotification.owner_open_id == (account.open_id if account else "")),
+                    "pending": count(StatusNotification, StatusNotification.status.in_(["queued", "blocked_permission"]), StatusNotification.owner_open_id == (account.open_id if account else "")),
+                    "unknown": count(StatusNotification, StatusNotification.status == "unknown", StatusNotification.owner_open_id == (account.open_id if account else "")),
+                },
                 "approval_automation": {
                     "enabled": settings.approval_automation_enabled,
                     **policy_summary(settings),
@@ -492,6 +500,17 @@ def create_app(settings=None, *, transport=None):
                     )
                 ]
             }
+
+    @app.get("/api/status-notifications", dependencies=[Depends(authenticated)])
+    def status_notifications(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+        with sessions() as db:
+            owner = db.get(Account, 1)
+            if not owner:
+                return {"items": [], "has_more": False}
+            rows = db.scalars(select(StatusNotification).where(
+                StatusNotification.owner_open_id == owner.open_id,
+            ).order_by(StatusNotification.created_at.desc(), StatusNotification.id).offset(offset).limit(limit + 1)).all()
+            return page(rows, limit, notification_view)
 
     @app.get("/api/attention", dependencies=[Depends(authenticated)])
     def attention_records(

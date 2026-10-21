@@ -25,6 +25,7 @@ from app.healthcheck import check_health
 from app.model_review import ModelReviewService
 from app.models import WorkerState, utcnow
 from app.security import Security
+from app.status_notifications import StatusNotificationService
 from app.sync import SyncService
 
 
@@ -85,6 +86,8 @@ async def run(settings):
     ws_http = FeishuClient(settings, security, sessions)
     approval_http = FeishuClient(settings, security, sessions)
     attention_http = FeishuClient(settings, security, sessions)
+    status_http = FeishuClient(settings, security, sessions)
+    notifications = StatusNotificationService(settings, sessions, status_http)
     attention_model = MessageImportanceClient(settings) if settings.attention_enabled else None
     attention = AttentionService(settings, sessions, attention_http, attention_model)
     model_client = ApprovalModelClient(settings) if settings.approval_model_enabled else None
@@ -167,9 +170,34 @@ async def run(settings):
             except TimeoutError:
                 pass
 
+    async def notify_status():
+        while not stopping.is_set():
+            try:
+                if settings.status_notifications_enabled:
+                    await asyncio.to_thread(notifications.tick)
+                    permissions = await asyncio.to_thread(status_http.self_message_permissions)
+                    worker_status(
+                        sessions, "status_notifications",
+                        "running" if permissions["ready"] else "blocked_permission",
+                        None if permissions["ready"] else "self_message_permission_required",
+                        **permissions,
+                    )
+                else:
+                    worker_status(sessions, "status_notifications", "disabled")
+            except Exception as exc:
+                worker_status(
+                    sessions, "status_notifications", "error",
+                    exc.code if isinstance(exc, AppError) else "status_notification_error",
+                )
+            try:
+                await asyncio.wait_for(stopping.wait(), timeout=3)
+            except TimeoutError:
+                pass
+
     reconcile_task = asyncio.create_task(reconcile())
     approval_task = asyncio.create_task(review_approvals())
     attention_task = asyncio.create_task(check_attention())
+    status_task = asyncio.create_task(notify_status())
     ping_task = asyncio.create_task(socket._ping_loop())
     next_connect, retry_delay, heartbeat = 0, 2, 0
     try:
@@ -226,6 +254,7 @@ async def run(settings):
         await reconcile_task
         await approval_task
         await attention_task
+        await status_task
         await socket._disconnect()
         remaining = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         for task in remaining:
@@ -237,6 +266,7 @@ async def run(settings):
         ws_http.close()
         approval_http.close()
         attention_http.close()
+        status_http.close()
         if attention_model:
             attention_model.close()
         if model_client:

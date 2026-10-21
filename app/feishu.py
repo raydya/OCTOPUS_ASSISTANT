@@ -279,6 +279,12 @@ class FeishuClient:
         missing = [name for name, choices in alternatives.items() if not granted.intersection(choices)]
         return {"ready": not missing, "missing_scopes": missing}
 
+    def self_message_permissions(self):
+        granted = set(self._attention_credentials().get("scope", "").split())
+        send_scopes = {"im:message:send_as_bot", "im:message", "im:message:send"}
+        missing = [] if granted.intersection(send_scopes) else ["im:message:send_as_bot"]
+        return {"ready": not missing, "missing_scopes": missing}
+
     def _attention_identity(self):
         if not self.attention_permissions()["ready"]:
             raise AppError(
@@ -297,6 +303,42 @@ class FeishuClient:
             raise AppError("invalid_reminder", "提醒内容无效。", 422)
         if not isinstance(uuid, str) or not 1 <= len(uuid) <= 50:
             raise AppError("invalid_reminder", "提醒去重标识无效。", 422)
+        return self._send_bot_text(owner, token, message, uuid)
+
+    def send_self_status(self, message: str, uuid: str, *, expected_owner: str) -> dict:
+        if not isinstance(message, str) or not message.strip() or len(message) > 10000:
+            raise AppError("invalid_status_message", "状态私信内容无效。", 422)
+        if not isinstance(uuid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,50}", uuid):
+            raise AppError("invalid_status_message", "状态私信去重标识无效。", 422)
+        if not isinstance(expected_owner, str) or not expected_owner.strip():
+            raise AppError("status_owner_changed", "状态私信收件人与绑定账号不一致。", 409)
+        if not self.self_message_permissions()["ready"]:
+            raise AppError(
+                "self_message_permission_required",
+                "请在飞书后台开通应用身份的发送消息权限并发布。", 409,
+            )
+        token = self._attention_credentials()["access_token"]
+        # Resolve the recipient after token refresh, immediately before the write.
+        # An old queued notice must never be redirected to a different account.
+        with self.sessions() as db:
+            account = db.get(Account, 1)
+            if not account:
+                raise AppError("connect_required", "请先连接飞书账号。", 409)
+            if account.open_id != expected_owner:
+                raise AppError("status_owner_changed", "状态私信收件人与绑定账号不一致。", 409)
+            owner = account.open_id
+        data = self._send_bot_text(
+            owner, token, message, uuid, invalid_response="invalid_status_response"
+        )
+        if not re.fullmatch(r"om_[A-Za-z0-9_-]{1,128}", data["message_id"]):
+            raise FeishuError("invalid_status_response")
+        return data
+
+    def _send_bot_text(
+        self, owner: str, token: str, message: str, uuid: str,
+        *, invalid_response: str = "invalid_reminder_response",
+    ) -> dict:
+        # POST is deliberately sent once; callers persist attempts before delivery.
         body = self._request(
             "POST", "/im/v1/messages", params={"receive_id_type": "open_id"},
             headers={"Authorization": f"Bearer {token}"},
@@ -305,9 +347,9 @@ class FeishuClient:
         )
         data = body.get("data")
         if not isinstance(data, dict) or not isinstance(data.get("message_id"), str):
-            raise FeishuError("invalid_reminder_response")
+            raise FeishuError(invalid_response)
         if not data["message_id"].startswith("om_"):
-            raise FeishuError("invalid_reminder_response")
+            raise FeishuError(invalid_response)
         return data
 
     def phone_self(self, reminder_message_id: str) -> dict:
