@@ -44,6 +44,7 @@ from app.status_notice_content import (
     dms_receipt_revision,
     dms_received_notice,
     mention_received_notice,
+    status_message_text,
 )
 
 LOCK_ID = 81024006
@@ -392,6 +393,7 @@ class StatusNotificationService:
                 # Revalidate the trusted source immediately before sending,
                 # while allowing its current business state to have advanced.
                 self._observe(db, owner.open_id, latest)
+            row.text = status_message_text(row.text)
             row.status, row.submitted_at, row.updated_at = "sending", utcnow(), utcnow()
             row.error_code, row.next_attempt_at = None, None
             message, expected_owner = row.text, row.owner_open_id

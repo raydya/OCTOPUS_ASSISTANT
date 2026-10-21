@@ -189,6 +189,50 @@ SDK 处理 WSS 协议、分片与心跳；进程监督重连并限制获取连�
 - 用户访问/刷新令牌使用 Fernet 加密，刷新用行锁串行化。消息正文和审批内容存于普通数据库字段及 JSONB，数据库本身并非全库加密。请保留 `TOKEN_ENCRYPTION_KEY`。
 - 退出工作台结束浏览器会话和未完成的设备授权，后台同步继续。停止后台同步可执行 `docker compose stop worker`；撤销用户授权需在飞书账号授权管理中操作。
 
+## 平台研发服务清单
+
+[平台研发团队服务清单](docs/platform-team-services.md) 从 Crane 完整分页读取应用和团队目录，按平台研发部（部门 ID `3`、标识 `platform`）的团队归属整理；包含所有登记类型，关联集群不代表当前正在运行。每次成功更新记录新增、移出和资料变更，查询失败或分页不完整时保留旧清单。
+
+本机定时任务每天北京时间 **15:00** 更新项目内 Markdown，使用现有 `cockpit` 登录，不复制凭据，也不调用模型。安装要求 macOS 系统时区为 `Asia/Shanghai`；当前用户需保持登录、内网及 cockpit 认证可用，休眠错过时唤醒后补跑。该任务独立于 Docker 服务。
+
+```bash
+.venv/bin/python scripts/update_platform_services.py
+.venv/bin/python scripts/platform_services_schedule.py install
+.venv/bin/python scripts/platform_services_schedule.py status
+# 停止定时更新：
+.venv/bin/python scripts/platform_services_schedule.py stop
+```
+
+运行结果和日志保存在 `.data/platform-services/`，不会提交本地认证或运行快照。文档由脚本生成，团队归属应在 Crane 修改。
+
+## 平台研发错误日志日报
+
+本机任务每天北京时间 **16:00** 统计截至当日 16:00 的最近 24 小时，将 `cn-shanghai / pro-jd-sh-service / error` 日志记录的 `topic` 字段与平台研发服务清单精确匹配，按错误机制归并。服务归属使用当日 Crane 清单，缺失或过期时自动刷新。
+
+每个错误类别附可复制的 TLS 查询语句、服务名与北京时间查询范围；有真实 swtid 时用它定位，否则使用日志中的错误特征。查询由 TLS 实际核验，定位信息不由模型生成。
+
+报告在[ERROR LOG 治理目录](https://atrenew.feishu.cn/wiki/Z7FUwrWH3ioGtPk3o41cUqojnvg)下按 `YYYY-MM-DD 平台研发错误日志日报` 创建。TLS 聚合给出错误量；代表日志结合 Grafana 指标及 Crane 发布记录分析原因和具体处置建议。模型使用 **gpt-6-sol / xhigh**，没有工具或执行生产变更的权限；没有因果证据的根因标为待核实。查询缺口、样本截断及分析覆盖范围会在文档中说明。
+
+```bash
+# 执行最近已结束的 16:00 日报窗口；同日成功后不会重复创建
+.venv/bin/python scripts/run_tls_error_report.py
+# 补齐或修订已发布的当天报告，更新原文档
+.venv/bin/python scripts/run_tls_error_report.py --republish
+# 仅采集与交叉核验，不调用模型、发布或通知
+.venv/bin/python scripts/run_tls_error_report.py --collect-only
+# 补跑指定已结束的日期
+.venv/bin/python scripts/run_tls_error_report.py --date 2026-10-21
+.venv/bin/python scripts/tls_report_schedule.py install
+.venv/bin/python scripts/tls_report_schedule.py status
+.venv/bin/python scripts/tls_report_schedule.py stop
+```
+
+采集和分析任务运行在宿主机，私信通知复用 Docker 中现有 Octopus 应用机器人，需保持 `app` 容器运行。要求本机用户登录、系统时区为 `Asia/Shanghai`，且 `ve >= 1.1.11`、`cockpit`、`lark-cli`、`docker` 和 Codex 现有认证可用。Grafana 使用本地 `.codex/config.toml` 中已配置的服务账号；不复制凭据到报告或定时任务。电脑休眠时，唤醒后补跑最近一个已结束窗口，不承诺补齐关机期间的所有日期。
+
+日报发布或更新成功后，机器人向绑定本人私信发送日期、统计及飞书文档链接；任务失败也发送简短状态。相同文档内容重复执行不重复提醒，失败后恢复成功可另行通知。通知失败不会抹掉文档已发布的状态，重跑只补通知；提交结果不明确时不盲目重发。
+
+运行状态、脱敏证据、定位查询、模型结论、私信及发布记录位于 `.data/tls-error-reports/`；`last-run.json` 和 `schedule.stderr.log` 用于排查。单机进程锁避免并发，失败保留中间结果供重跑；飞书提交结果不明确时先核对远端，避免重复建文档。更新已有报告时只更新本任务创建且未被人工修改的内容。
+
 ## 接口
 
 除了首页、静态文件、登录和 `/healthz`，均需登录。登录后的所有 POST 请求需要 `X-CSRF-Token`，由 `/api/status` 返回。没有授权回调路由或事件接收 HTTP 路由。

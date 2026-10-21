@@ -55,18 +55,25 @@ def _links(base_url, chat_id=""):
     return lines
 
 
+def status_message_text(value):
+    """Omit the workbench footer, including in previously queued notices."""
+    return "\n".join(line for line in value.split("\n") if not line.startswith("工作台："))
+
+
 def _notice(source_type, source_id, phase, title, lines, *, terminal=False):
     if not isinstance(source_id, str) or not source_id:
         return None
     title = _short(title, 240)
     body = "\n".join([title, *(line for line in lines if line)])
+    # Retain the historical fingerprint: hiding a footer must not resend every
+    # previously observed status as though its business state had changed.
     semantic = [source_type, source_id, phase, title, body, terminal]
     revision = hashlib.sha256(
         json.dumps(semantic, ensure_ascii=False, separators=(",", ":")).encode()
     ).hexdigest()
     return {
         "source_type": source_type, "source_id": source_id, "phase": phase,
-        "title": title, "text": body, "revision": revision, "terminal": terminal,
+        "title": title, "text": status_message_text(body), "revision": revision, "terminal": terminal,
     }
 
 
