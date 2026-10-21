@@ -233,6 +233,21 @@ SDK 处理 WSS 协议、分片与心跳；进程监督重连并限制获取连�
 
 运行状态、脱敏证据、定位查询、模型结论、私信及发布记录位于 `.data/tls-error-reports/`；`last-run.json` 和 `schedule.stderr.log` 用于排查。单机进程锁避免并发，失败保留中间结果供重跑；飞书提交结果不明确时先核对远端，避免重复建文档。更新已有报告时只更新本任务创建且未被人工修改的内容。
 
+### ve / TLS 登录态维护
+
+独立的 macOS LaunchAgent 每 **30 分钟**执行一次轻量检查，用户登录或安装任务时也执行。先调用 `ve sts GetCallerIdentity --output off`，再调用 `ve volclog --region cn-shanghai doctor --online`，让官方 CLI 在需要时自动续期，并分别验证 ve 和 TLS 是否可用。任务不调用模型、不扫描错误日志，执行完退出；没有常驻轮询或失败后密集重试。
+
+```bash
+.venv/bin/python scripts/maintain_ve_session.py
+.venv/bin/python scripts/ve_session_schedule.py install
+.venv/bin/python scripts/ve_session_schedule.py status
+.venv/bin/python scripts/ve_session_schedule.py stop
+```
+
+`ve` 与 `volclog` 的 Console Login 缓存相互独立：ve 续期失败时，TLS 仍可能正常查询。检查结果保存在 `.data/ve-session/last-run.json`，包含分别的状态、最近成功时间和 TLS 临时凭证到期时间；`healthy` 表示当次验证通过，`reauth_required` 表示需要恢复对应登录。仅保存经过筛选的状态，不读取或复制认证文件、AK/SK、token；定时任务沿用各 CLI 默认 profile。
+
+这不能保证授权永不失效。[TLS 官方认证说明](https://github.com/volcengine-tls/ve-tls-cli/blob/b451c506f24573dc0e71220e7ad15339ed7f04e4/docs/2-Authentication_zh.md)规定有效期以服务端返回为准，临近到期时才自动刷新；授权过期、撤销或刷新令牌被拒绝后，仍需本人通过对应 CLI 的登录流程重新授权。后台不会自动发起交互登录、切换账号或修改认证缓存。电脑关机、休眠、退出当前用户或断网期间不能保证检查按时运行；恢复联网运行后下一次检查重试。维护检查本身不发私信；若影响日报，沿用日报失败通知。
+
 ## 接口
 
 除了首页、静态文件、登录和 `/healthz`，均需登录。登录后的所有 POST 请求需要 `X-CSRF-Token`，由 `/api/status` 返回。没有授权回调路由或事件接收 HTTP 路由。
