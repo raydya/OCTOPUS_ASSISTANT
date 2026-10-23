@@ -50,6 +50,7 @@ from app.status_notice_content import (
 LOCK_ID = 81024006
 UNSENT = {"queued", "blocked_permission"}
 SEND_LIMIT = 3
+MESSAGE_EXPIRED = "status_message_expired"
 
 
 def source_key(owner, kind, identifier):
@@ -119,12 +120,28 @@ class StatusNotificationService:
         ):
             return None
         row = db.get(MessageAttention, message.message_id, populate_existing=True)
+        submitted_result, suppress = False, False
         if (
             row and row.source_type == "message" and row.owner_open_id == owner
             and row.chat_id == message.chat_id and row.source_hash == source_hash(message.raw)
         ):
-            return attention_notice(row, base_url=self.settings.app_base_url)
-        return mention_received_notice(message, chat, base_url=self.settings.app_base_url)
+            payload = attention_notice(row, base_url=self.settings.app_base_url)
+            suppress = row.status == "skipped_restart"
+            # Preserve facts about actual outbound attempts, even if their
+            # result notification waits longer than an ordinary status update.
+            submitted_result = bool(
+                row.phone_submitted_at and row.status in {"calling", "phone_unknown", "phone_accepted"}
+                or row.reminder_submitted_at and row.status in {"reminder_sending", "reminder_unknown"}
+            )
+        else:
+            payload = mention_received_notice(message, chat, base_url=self.settings.app_base_url)
+        return {
+            **payload,
+            "message_expired": message.create_time + self.settings.attention_timeout_seconds * 1000
+            <= int(utcnow().timestamp() * 1000),
+            "suppress_notification": suppress,
+            "submitted_result": submitted_result,
+        }
 
     def _refresh(self, db, source, owner):
         if source.source_type == "approval":
@@ -218,6 +235,17 @@ class StatusNotificationService:
             return
         key = source_key(owner, payload["source_type"], payload["source_id"])
         source = db.get(StatusNoticeSource, key)
+        is_message = payload["source_type"] == "message"
+        submitted_result = is_message and payload.get("submitted_result") is True
+        suppress = is_message and payload.get("suppress_notification") is True
+        if suppress:
+            if source:
+                source.notify_changes = False
+            db.execute(update(StatusNotification).where(
+                StatusNotification.source_key == key,
+                StatusNotification.status.in_(UNSENT),
+                StatusNotification.submitted_at.is_(None),
+            ).values(status="superseded", error_code=MESSAGE_EXPIRED, updated_at=utcnow()))
         if source and source.revision == payload["revision"]:
             return
         receipt = None
@@ -226,7 +254,12 @@ class StatusNotificationService:
                 receipt = self._new_dms_receipt(db, owner, payload)
             source = StatusNoticeSource(
                 key=key, owner_open_id=owner, source_type=payload["source_type"],
-                source_id=payload["source_id"], notify_changes=notify_changes,
+                source_id=payload["source_id"],
+                # Discovery time is not message time. Backfilled mentions get a
+                # durable silent baseline so re-syncs cannot revive old notices.
+                notify_changes=notify_changes and not suppress and not (
+                    is_message and payload.get("message_expired") is True and not submitted_result
+                ),
                 created_at=utcnow(),
             )
             db.add(source)
@@ -239,7 +272,7 @@ class StatusNotificationService:
             # receipt remains a separate, durable step in the notification flow.
             StatusNotification.revision != dms_receipt_revision(source.source_id),
         ).values(status="superseded", updated_at=utcnow()))
-        if baseline or not source.notify_changes:
+        if baseline or not source.notify_changes and not submitted_result:
             return
         if receipt:
             db.add(StatusNotification(
@@ -253,7 +286,10 @@ class StatusNotificationService:
             StatusNotification.revision == payload["revision"],
         ))
         if existing:
-            if existing.submitted_at is None and existing.status == "superseded":
+            if (
+                existing.submitted_at is None and existing.status == "superseded"
+                and existing.error_code != MESSAGE_EXPIRED
+            ):
                 existing.status, existing.error_code, existing.next_attempt_at = "queued", None, None
                 existing.updated_at = utcnow()
             return
@@ -372,6 +408,18 @@ class StatusNotificationService:
                 raise AppError("status_owner_changed", "即时私信绑定的账号不一致。", 409)
             source = db.get(StatusNoticeSource, row.source_key)
             latest = self._refresh(db, source, owner.open_id) if source else None
+            if source and source.source_type == "message" and latest:
+                submitted_result = latest.get("submitted_result") is True
+                expired = not submitted_result and (
+                    not source.notify_changes
+                    or row.phase == "received" and latest.get("message_expired") is True
+                    or row.created_at + timedelta(seconds=self.settings.attention_timeout_seconds) <= utcnow()
+                )
+                if latest.get("suppress_notification") is True or expired:
+                    row.status, row.error_code, row.updated_at = "superseded", MESSAGE_EXPIRED, utcnow()
+                    if latest.get("suppress_notification") is True:
+                        self._observe(db, owner.open_id, latest)
+                    return False
             is_receipt = bool(
                 source and source.source_type == "dms_card"
                 and row.revision == dms_receipt_revision(source.source_id)

@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import re
 import signal
 import sys
 import time
@@ -22,11 +23,49 @@ from app.errors import AppError, FeishuError
 from app.events import BackgroundSync, EventInboxHandler, worker_status
 from app.feishu import FeishuClient
 from app.healthcheck import check_health
+from app.mention_sync import REQUIRED_SCOPE, MentionSync
 from app.model_review import ModelReviewService
 from app.models import WorkerState, utcnow
 from app.security import Security
 from app.status_notifications import StatusNotificationService
 from app.sync import SyncService
+
+
+def sync_mentions_once(sessions, mentions):
+    """One isolated read, returning whether a short write-lock conflict occurred."""
+    try:
+        result = mentions.run()
+    except Exception as exc:
+        code = exc.code if isinstance(exc, AppError) else "mention_sync_unavailable"
+        if not isinstance(code, str) or not re.fullmatch(r"[a-zA-Z0-9_:-]{1,64}", code):
+            code = "mention_sync_unavailable"
+        result = {"status": "error", "error_code": code, "required_scope": REQUIRED_SCOPE}
+    worker_status(sessions, "mentions", **result)
+    return result.get("error_code") == "mention_sync_busy"
+
+
+async def poll_mentions(settings, sessions, mentions, stopping):
+    """Run independently of historical HTTP reads; never overlap this reader."""
+    interval = max(60, settings.sync_interval_seconds)
+    busy_retries = 0
+    while not stopping.is_set():
+        started = time.monotonic()
+        try:
+            busy = await asyncio.to_thread(sync_mentions_once, sessions, mentions)
+        except Exception:
+            # If the status database itself is unavailable, keep this loop alive
+            # without printing exceptions that can contain private parameters.
+            busy = False
+        if busy and busy_retries < 2:
+            busy_retries += 1
+            delay = 5
+        else:
+            busy_retries = 0
+            delay = max(1, interval - (time.monotonic() - started))
+        try:
+            await asyncio.wait_for(stopping.wait(), timeout=delay)
+        except TimeoutError:
+            pass
 
 
 class FeishuSocket(Client):
@@ -87,6 +126,7 @@ async def run(settings):
     approval_http = FeishuClient(settings, security, sessions)
     attention_http = FeishuClient(settings, security, sessions)
     status_http = FeishuClient(settings, security, sessions)
+    mentions_http = FeishuClient(settings, security, sessions)
     notifications = StatusNotificationService(settings, sessions, status_http)
     attention_model = MessageImportanceClient(settings) if settings.attention_enabled else None
     attention = AttentionService(settings, sessions, attention_http, attention_model)
@@ -96,6 +136,9 @@ async def run(settings):
         model_review=ModelReviewService(settings, sessions, model_client) if model_client else None,
     )
     sync = BackgroundSync(settings, sessions, feishu, SyncService(settings, sessions, feishu))
+    mentions = MentionSync(
+        settings, sessions, mentions_http, SyncService(settings, sessions, mentions_http),
+    )
     socket = FeishuSocket(settings, ws_http, EventInboxHandler(settings, sessions))
     stopping = asyncio.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -195,6 +238,7 @@ async def run(settings):
                 pass
 
     reconcile_task = asyncio.create_task(reconcile())
+    mentions_task = asyncio.create_task(poll_mentions(settings, sessions, mentions, stopping))
     approval_task = asyncio.create_task(review_approvals())
     attention_task = asyncio.create_task(check_attention())
     status_task = asyncio.create_task(notify_status())
@@ -252,6 +296,7 @@ async def run(settings):
         ping_task.cancel()
         # Let in-flight API/DB work finish before disposing shared resources.
         await reconcile_task
+        await mentions_task
         await approval_task
         await attention_task
         await status_task
@@ -267,6 +312,7 @@ async def run(settings):
         approval_http.close()
         attention_http.close()
         status_http.close()
+        mentions_http.close()
         if attention_model:
             attention_model.close()
         if model_client:

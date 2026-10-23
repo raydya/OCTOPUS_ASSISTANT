@@ -1,7 +1,7 @@
 import json
 import re
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 
 import httpx
@@ -151,12 +151,16 @@ class FeishuClient:
             self.security.apply_token(account, token)
             return token["access_token"]
 
-    def _get(self, path: str, params: dict) -> dict:
+    def _get(self, path: str, params: dict | list[tuple[str, str]]) -> dict:
+        return self._user_read("GET", path, params=params)
+
+    def _user_read(self, method: str, path: str, **kwargs) -> dict:
+        """Read as the bound user; retry only an explicitly rejected user token."""
         token = self.access_token()
         for attempt in range(2):
             try:
                 body = self._request(
-                    "GET", path, params=params, headers={"Authorization": f"Bearer {token}"}
+                    method, path, headers={"Authorization": f"Bearer {token}"}, **kwargs
                 )
                 data = body.get("data")
                 if not isinstance(data, dict):
@@ -206,6 +210,110 @@ class FeishuClient:
                 **({"page_token": page_token} if page_token else {}),
             },
         )
+
+    def chat(self, chat_id: str) -> dict:
+        if not isinstance(chat_id, str) or not re.fullmatch(r"oc_[A-Za-z0-9_-]+", chat_id):
+            raise AppError("invalid_chat_id", "会话标识无效。", 422)
+        data = self._get(f"/im/v1/chats/{chat_id}", {"user_id_type": "open_id"})
+        # This endpoint normally omits chat_id. Bind metadata to the requested
+        # chat, while rejecting a contradictory identifier if one is returned.
+        if not data or ("chat_id" in data and data["chat_id"] != chat_id):
+            raise FeishuError("invalid_chat_response")
+        return {**data, "chat_id": chat_id}
+
+    def search_mentions(self, start: str, end: str, page_token: str | None = None) -> dict:
+        """Search the user's mentions; hits may include @all and need mget validation."""
+        timestamp_pattern = (
+            r"\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])"
+            r"T([01]\d|2[0-3]):[0-5]\d:[0-5]\d"
+            r"(Z|[+-]([01]\d|2[0-3]):?[0-5]\d)"
+        )
+        try:
+            if any(
+                not isinstance(value, str) or not re.fullmatch(timestamp_pattern, value)
+                for value in (start, end)
+            ):
+                raise ValueError
+            if datetime.fromisoformat(start) >= datetime.fromisoformat(end):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise AppError("invalid_mention_range", "消息搜索需要有效的带时区起止时间。", 422) from None
+        if page_token is not None and (not isinstance(page_token, str) or not page_token):
+            raise AppError("invalid_page_token", "消息搜索分页标识无效。", 422)
+        data = self._user_read(
+            "POST",
+            "/im/v1/messages/search",
+            params={
+                "page_size": 30,
+                "user_id_type": "open_id",
+                **({"page_token": page_token} if page_token else {}),
+            },
+            json={
+                "query": "",
+                "filter": {
+                    "is_at_me": True,
+                    "time_range": {"start_time": start, "end_time": end},
+                },
+            },
+        )
+        rows = data.get("items")
+        has_more = data.get("has_more")
+        next_token = data.get("page_token")
+        if (
+            not isinstance(rows, list)
+            or type(has_more) is not bool
+            or (next_token is not None and not isinstance(next_token, str))
+            or bool(next_token) != has_more
+            or (has_more and next_token == page_token)
+            or ("notice" in data and not isinstance(data["notice"], str))
+            or (
+                "total" in data
+                and (type(data["total"]) is not int or data["total"] < 0)
+            )
+        ):
+            raise FeishuError("invalid_mention_search")
+        for row in rows:
+            metadata = row.get("meta_data") if isinstance(row, dict) else None
+            identifier = metadata.get("message_id") if isinstance(metadata, dict) else None
+            if not isinstance(identifier, str) or not re.fullmatch(r"om_[A-Za-z0-9_-]+", identifier):
+                raise FeishuError("invalid_mention_search")
+        # Preserve provider notice and all metadata: a notice can mean partial
+        # results, so the caller must decide whether its checkpoint can advance.
+        return data
+
+    def messages_by_ids(self, message_ids: list[str]) -> list[dict]:
+        if (
+            not isinstance(message_ids, list)
+            or not 1 <= len(message_ids) <= 50
+            or any(
+                not isinstance(identifier, str)
+                or not re.fullmatch(r"om_[A-Za-z0-9_-]+", identifier)
+                for identifier in message_ids
+            )
+            or len(set(message_ids)) != len(message_ids)
+        ):
+            raise AppError("invalid_message_ids", "消息查询需要 1–50 个不同消息标识。", 422)
+        data = self._get(
+            "/im/v1/messages/mget",
+            [
+                ("card_msg_content_type", "raw_card_content"),
+                ("with_sender_name", "true"),
+                *(("message_ids", identifier) for identifier in message_ids),
+            ],
+        )
+        rows = data.get("items")
+        if not isinstance(rows, list):
+            raise FeishuError("invalid_message_response")
+        requested = set(message_ids)
+        seen = set()
+        for row in rows:
+            identifier = row.get("message_id") if isinstance(row, dict) else None
+            if not isinstance(identifier, str) or identifier not in requested or identifier in seen:
+                raise FeishuError("invalid_message_response")
+            seen.add(identifier)
+        # Missing/deleted/inaccessible messages remain visible as missing to the
+        # caller; never substitute search snippets for full message content.
+        return rows
 
     def messages(self, container_id: str, parameters: dict, page_token: str | None) -> dict:
         return self._get(

@@ -69,12 +69,14 @@ function updateSyncLabels() {
   if (state.chat) pairs.push([state.thread ? `thread:${state.thread}` : `messages:${state.chat.chat_id}`, "sync-messages", "message-restart", "同步消息"]);
   for (const [key, buttonId, restartId, label] of pairs) {
     const partial = Boolean(syncState(key)?.has_more);
+    const disabledSync = state.status?.reminders_only && !key.startsWith("approvals:");
+    $(buttonId).hidden = Boolean(disabledSync);
     if ($(buttonId).textContent !== "正在读取…") $(buttonId).textContent = partial ? "继续同步" : label;
-    $(restartId).hidden = !partial;
+    $(restartId).hidden = Boolean(disabledSync) || !partial;
     if (!connected) $(buttonId).disabled = true;
     else if ($(buttonId).textContent !== "正在读取…") $(buttonId).disabled = false;
   }
-  $("chat-sync-note").textContent = syncNote("chats");
+  $("chat-sync-note").textContent = state.status?.reminders_only ? "普通与历史消息同步已停用。" : syncNote("chats");
   $("approval-sync-note").textContent = syncNote(`approvals:${state.topic}`);
   if (state.chat) {
     const key = state.thread ? `thread:${state.thread}` : `messages:${state.chat.chat_id}`;
@@ -82,7 +84,7 @@ function updateSyncLabels() {
     let note = syncNote(key);
     if (s?.parameters.start_time) note += `；范围 ${date(Number(s.parameters.start_time) * 1000)} 至 ${date(Number(s.parameters.end_time) * 1000)}`;
     $("message-note").textContent = note;
-    $("days").hidden = Boolean(state.thread);
+    $("days").hidden = Boolean(state.status?.reminders_only || state.thread);
     $("days").disabled = Boolean(s?.has_more);
     if (s?.has_more && s.parameters.start_time) $("days").value = String(Math.round((Number(s.parameters.end_time) - Number(s.parameters.start_time)) / 86400));
   }
@@ -90,6 +92,9 @@ function updateSyncLabels() {
 async function refreshStatus() {
   state.status = await api("/api/status");
   const s = state.status;
+  document.querySelector('[data-view="chats"]').hidden = Boolean(s.reminders_only);
+  document.querySelector('[data-view="connection"] span').textContent = s.reminders_only ? "提醒与连接" : "连接与同步";
+  if (s.reminders_only && state.view === "chats") showView("connection");
   $("login-screen").hidden = true;
   $("workspace").hidden = false;
   $("account-name").textContent = s.account?.name || "尚未连接飞书";
@@ -103,11 +108,11 @@ async function refreshStatus() {
   $("setup-banner").hidden = Boolean(s.account);
   $("connection-description").textContent = !s.configured ? "请在 .env 填写 App ID 和 App Secret，然后重启应用。" : s.account ? `已连接 ${s.account.name}。${s.account.can_refresh ? "授权令牌将自动刷新。" : "未获得离线授权，令牌到期后需要重新连接。"}` : "应用凭证已配置，点击右上角连接飞书完成用户授权。";
   const info = $("connection-info");
-  info.replaceChildren(el("dt", "接入方式"), el("dd", "WebSocket 长连接 + 设备授权"), el("dt", "个人数据自动同步"), el("dd", `每 ${s.sync_interval_seconds} 秒安排一轮；当前排队 ${s.queued_syncs} 项。`));
-  const workerLabels = { events: "事件连接", sync: "数据同步", subscriptions: "个人审批订阅", approval_review: "审批自动核验", approval_model: "审批模型", attention: "待处理事项电话提醒", status_notifications: "即时状态私信" };
+  info.replaceChildren(el("dt", "接入方式"), el("dd", "WebSocket 长连接 + 设备授权"), el("dt", "工作模式"), el("dd", s.reminders_only ? "仅及时提醒：普通与历史消息同步已停用。" : `每 ${s.sync_interval_seconds} 秒安排普通同步；当前排队 ${s.queued_syncs} 项。`));
+  const workerLabels = { events: "事件连接", sync: s.reminders_only ? "审批与 DMS 提醒读取" : "数据同步", mentions: "@ 我的消息检查", subscriptions: "个人审批订阅", approval_review: "审批自动核验", approval_model: "审批模型", attention: "待处理事项电话提醒", status_notifications: "即时状态私信" };
   const workerStates = { connected: "在线", connecting: "连接中", reconnecting: "正在重连", remote_connection_busy: "该应用已有其他长连接，请先停止其他接收进程", waiting_authorization: "等待账号授权", not_configured: "等待应用凭证", subscribed: "用户订阅注册成功", syncing: "同步中", running: "核验运行中", ready: "本机运行环境就绪", disabled: "未启用", idle: "等待下一轮", blocked_permission: "等待应用权限开通", error: "需要检查", stopped: "已停止" };
   for (const worker of s.workers) {
-    const label = worker.name === "approval_model" ? modelRuntimeLabel(worker) : worker.name === "attention" && worker.status === "running" ? "监控运行中" : workerStates[worker.status] || worker.status;
+    const label = worker.name === "mentions" ? ({ blocked_permission: "等待消息搜索授权：search:message", running: "新 @ 消息同步中", synced: "近期 @ 消息已同步", partial: "搜索结果不完整，等待复查" }[worker.status] || workerStates[worker.status] || worker.status) : worker.name === "approval_model" ? modelRuntimeLabel(worker) : worker.name === "attention" && worker.status === "running" ? "监控运行中" : workerStates[worker.status] || worker.status;
     info.append(el("dt", workerLabels[worker.name] || worker.name), el("dd", `${worker.stale ? "进程心跳超时" : label}${worker.error_code ? `（${worker.error_code}）` : ""}`));
   }
   if (s.account) info.append(el("dt", "账号标识"), el("dd", s.account.open_id), el("dt", "当前令牌到期时间"), el("dd", date(s.account.expires_at)));
@@ -717,7 +722,7 @@ $("login-form").onsubmit = async (event) => {
   event.preventDefault(); $("login-error").textContent = "";
   const button = event.currentTarget.querySelector("button");
   button.disabled = true;
-  try { await api("/auth/login", "POST", { password: $("password").value }); $("password").value = ""; await refreshStatus(); await loadChats(); }
+  try { await api("/auth/login", "POST", { password: $("password").value }); $("password").value = ""; await refreshStatus(); await loadInitialView(); }
   catch (error) { $("login-error").textContent = error.message; }
   finally { button.disabled = false; }
 };
@@ -733,8 +738,8 @@ async function pollDevice() {
       deviceTimer = setTimeout(pollDevice, Math.max(1, result.interval || 5) * 1000);
     } else if (result.status === "connected") {
       $("device-authorization").hidden = true;
-      await refreshStatus(); await loadChats();
-      notice("飞书已授权，后台将自动同步会话和审批。");
+      await refreshStatus(); await loadInitialView();
+      notice(state.status.reminders_only ? "飞书已授权，后台将检查 @、审批和 DMS 提醒。" : "飞书已授权，后台将自动同步会话和审批。");
     } else {
       const labels = { denied: "你已取消授权，可重新点击连接飞书。", expired: "授权已过期，请重新点击连接飞书。", failed: "授权未完成，请检查权限后重新连接。" };
       $("device-status").textContent = `${labels[result.status] || "请重新连接。"}${result.error_code ? `（${result.error_code}）` : ""}`;
@@ -756,13 +761,20 @@ $("connect").onclick = () => busy($("connect"), async () => {
   deviceTimer = setTimeout(pollDevice, result.interval * 1000);
 });
 $("logout").onclick = () => busy($("logout"), async () => { await api("/auth/logout", "POST", {}); window.location.reload(); });
-document.querySelectorAll("[data-view]").forEach((button) => {
-  button.onclick = () => {
-    state.view = button.dataset.view;
-    document.querySelectorAll("[data-view]").forEach((x) => x.classList.toggle("active", x === button));
+function showView(view) {
+    state.view = view;
+    document.querySelectorAll("[data-view]").forEach((x) => x.classList.toggle("active", x.dataset.view === view));
     for (const view of ["chats", "approvals", "connection"]) $(`${view}-view`).hidden = view !== state.view;
     const labels = { chats: ["我的对话", "从最近的对话开始"], approvals: ["我的审批", "查看待办、已办和知会"], connection: ["连接与同步", "查看账号授权和数据更新情况"] };
+    if (state.status?.reminders_only) labels.connection = ["提醒与连接", "查看提醒处理状态和飞书连接"];
     [$("page-title").textContent, $("subtitle").textContent] = labels[state.view];
+}
+async function loadInitialView() {
+  return state.status?.reminders_only ? loadConnectionRecords() : loadChats();
+}
+document.querySelectorAll("[data-view]").forEach((button) => {
+  button.onclick = () => {
+    showView(button.dataset.view);
     const action = state.view === "chats" ? loadChats : state.view === "approvals" ? loadApprovals : loadConnectionRecords;
     action().catch((e) => notice(errorMessage(e), true));
   };
@@ -794,7 +806,7 @@ let searchTimer;
 $("chat-search").oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => loadChats().catch((e) => notice(errorMessage(e), true)), 250); };
 
 (async () => {
-  try { await refreshStatus(); await loadChats(); }
+  try { await refreshStatus(); await loadInitialView(); }
   catch (error) { if (error.code !== "login_required") notice(errorMessage(error), true); }
 })();
 

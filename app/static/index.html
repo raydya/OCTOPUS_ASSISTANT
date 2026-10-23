@@ -12,7 +12,7 @@
 <body>
   <div id="notice" class="notice" role="status" hidden></div>
   <main id="login-screen" class="login-screen">
-    <section class="login-intro"><span class="mark" aria-hidden="true">◉</span><p>Octopus Assistant</p><h1>把注意力留给<br>真正重要的事。</h1><p class="intro-copy">你的飞书对话和审批，<br>在一个安静的工作台里查看。</p><span class="phase">信息同步 · 审批核验</span></section>
+    <section class="login-intro"><span class="mark" aria-hidden="true">◉</span><p>Octopus Assistant</p><h1>把注意力留给<br>真正重要的事。</h1><p class="intro-copy">及时了解重要 @ 和审批进展，<br>需要你处理时主动提醒。</p><span class="phase">及时提醒 · 审批核验</span></section>
     <section class="login-panel"><form id="login-form"><h2>进入工作台</h2><p class="muted">输入本地配置中的工作台密码。</p><label for="password">工作台密码</label><input id="password" type="password" required autocomplete="current-password"><button type="submit" class="primary">登录</button><p id="login-error" role="alert"></p></form></section>
   </main>
   <div id="workspace" class="workspace" hidden>
@@ -27,10 +27,10 @@
     </aside>
     <main class="main">
       <header class="topbar"><div><p id="subtitle" class="muted">从最近的对话开始</p><h1 id="page-title">我的对话</h1></div><div class="top-actions"><span id="connection-badge" class="badge">未连接</span><button id="connect" class="primary">连接飞书</button></div></header>
-      <section id="setup-banner" class="setup-banner" hidden><div><strong>连接你的飞书账号</strong><p>完成授权后，同步会话与审批。每次同步的进度会保存在工作台。</p></div><span aria-hidden="true">↗</span></section>
+      <section id="setup-banner" class="setup-banner" hidden><div><strong>连接你的飞书账号</strong><p>完成授权后，后台检查 @、审批和 DMS 待办，并私信告知处理进度。</p></div><span aria-hidden="true">↗</span></section>
       <section id="device-authorization" class="connection-section" hidden aria-live="polite">
         <h2>在飞书确认授权</h2>
-        <p>打开下方链接，在飞书确认连接你的账号，然后回到此页面。授权完成后会自动开始同步。</p>
+        <p>打开下方链接，在飞书确认连接你的账号，然后回到此页面。授权完成后会自动开始检查提醒事项。</p>
         <p>授权码：<strong id="device-code"></strong> · <span id="device-expiry"></span></p>
         <a id="device-link" target="_blank" rel="noopener noreferrer">打开飞书授权页面 ↗</a>
         <p id="device-status" class="muted">等待你在飞书确认…</p>
@@ -49,7 +49,7 @@
         <div class="split-view"><section class="list-pane" aria-label="审批列表"><div id="approval-list" class="item-list"></div><button id="more-approvals" class="load-more" hidden>加载更多审批</button></section><section class="detail-pane approval-detail" aria-label="审批详情"><div id="approval-detail" class="empty"><span class="empty-icon" aria-hidden="true">☷</span><h2>审批信息，一处查看</h2><p>选择一项审批，查看核验结果、表单与处理记录。</p></div></section></div>
       </section>
       <section id="connection-view" class="view connection-view" hidden>
-        <section class="connection-section"><h2>飞书连接</h2><p id="connection-description"></p><dl id="connection-info"></dl><p class="muted">长连接接收已配置且可投递的审批变化和机器人可见的消息事件；个人数据通过用户授权接口定时同步。无需公网地址或回调配置。</p><p class="muted">个人审批“订阅注册成功”只表示用户订阅接口已注册，不代表审批实例事件已实际送达。后台没有实例事件选项时，由任务事件与定时读取补齐。</p><details><summary>查看申请的权限</summary><ul id="scope-list"></ul></details><p class="muted">权限需要在飞书开放平台开通并发布，然后由账号本人授权。组织限制的权限需要管理员开启。</p></section>
+        <section class="connection-section"><h2>飞书连接</h2><p id="connection-description"></p><dl id="connection-info"></dl><p class="muted">长连接接收已配置且可投递的审批变化和机器人可见的消息事件；提醒所需信息通过用户授权接口定时读取。无需公网地址或回调配置。</p><p class="muted">个人审批“订阅注册成功”只表示用户订阅接口已注册，不代表审批实例事件已实际送达。后台没有实例事件选项时，由任务事件与定时读取补齐。</p><details><summary>查看申请的权限</summary><ul id="scope-list"></ul></details><p class="muted">权限需要在飞书开放平台开通并发布，然后由账号本人授权。组织限制的权限需要管理员开启。</p></section>
         <section class="connection-section attention-section" aria-labelledby="attention-heading">
           <div class="section-tools"><h2 id="attention-heading">待处理事项电话提醒</h2><button id="refresh-attention" class="text-button">刷新提醒记录</button></div>
           <div class="attention-status" aria-live="polite"><strong id="attention-status-title">正在读取提醒状态…</strong><p id="attention-model" class="model-config"></p><p id="attention-policy"></p><p id="attention-worker-note" class="muted"></p></div>
@@ -65,9 +65,9 @@
           <p id="attention-history-note" class="muted"></p>
         </section>
         <section class="connection-section"><div class="section-tools"><h2>审批核验与处理记录</h2><button id="refresh-reviews" class="text-button">刷新核验记录</button></div><p class="muted">记录模型判断、参考依据、需要你回答的问题和处理结果。在“我的审批”中打开单据即可补充信息或作出决定。只有“已确认通过”表示执行结果已经确认。</p><div id="approval-reviews"></div><p id="review-history-note" class="muted"></p></section>
-        <section class="connection-section"><div class="section-tools"><h2>最近同步</h2><button id="refresh-runs" class="text-button">刷新记录</button></div><p class="muted">“部分完成”表示还有下一批；回到对应页面点击继续同步即可。</p><div id="sync-runs"></div></section>
+        <section class="connection-section"><div class="section-tools"><h2>后台读取记录</h2><button id="refresh-runs" class="text-button">刷新记录</button></div><p class="muted">记录后台读取的结果；过去的历史同步记录保留供查阅。</p><div id="sync-runs"></div></section>
       </section>
-      <footer>数据保存在你的工作台中。附件暂以消息类型展示，查看内容以最近一次同步为准。</footer>
+      <footer>及时提醒重要事项；普通与历史消息不再自动归档。</footer>
     </main>
   </div>
 </body>

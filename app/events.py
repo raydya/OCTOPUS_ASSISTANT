@@ -3,12 +3,13 @@
 import json
 from datetime import timedelta
 
-from sqlalchemy import case, delete, select
+from sqlalchemy import case, delete, literal, or_, select
 from sqlalchemy.dialects.postgresql import insert
 
 from app.errors import AppError
 from app.models import (
     Account,
+    ApprovalReview,
     ApprovalTask,
     Chat,
     EventInbox,
@@ -109,7 +110,50 @@ class BackgroundSync:
         self.next_snapshot = utcnow()
         self.next_subscription = utcnow()
 
+    @property
+    def reminders_only(self):
+        return getattr(self.settings, "reminders_only", True)
+
+    @property
+    def dms_configured(self):
+        return bool(self.settings.dms_sender_app_id and self.settings.dms_chat_id)
+
+    def reminder_instance_codes(self):
+        """Only current user tasks and genuinely unconfirmed submissions need reads."""
+        owner = select(Account.open_id).where(Account.id == 1).scalar_subquery()
+        pending = select(ApprovalTask.instance_code).where(
+            ApprovalTask.topic == "1", ApprovalTask.visible, ApprovalTask.status == "1",
+            ApprovalTask.raw["user_id"].as_string() == owner,
+        )
+        submitted = select(ApprovalReview.instance_code).where(
+            ApprovalReview.owner_open_id == owner,
+            ApprovalReview.submitted_at.is_not(None),
+            ApprovalReview.confirmed_at.is_(None),
+            ApprovalReview.execution_status.in_(["submitting", "unknown", "approved"]),
+            select(ApprovalTask.task_id).where(
+                ApprovalTask.task_id == ApprovalReview.task_id,
+                ApprovalTask.instance_code == ApprovalReview.instance_code,
+            ).exists(),
+        )
+        return pending.union(submitted)
+
+    def reminder_job_filter(self):
+        instances = self.reminder_instance_codes().subquery()
+        resources = ["approvals:1", *(["dms_cards"] if self.dms_configured else [])]
+        return or_(
+            SyncJob.resource.in_(resources),
+            SyncJob.resource.in_(select(literal("instance:") + instances.c.instance_code)),
+        )
+
+    def cancel_disallowed_jobs(self):
+        if self.reminders_only:
+            with self.sessions.begin() as db:
+                # Retain all cached messages and approvals; only cancel work
+                # that is outside the owner's reminder-only collection scope.
+                db.execute(delete(SyncJob).where(~self.reminder_job_filter()))
+
     def tick(self):
+        self.cancel_disallowed_jobs()
         with self.sessions() as db:
             if not db.get(Account, 1):
                 worker_status(self.sessions, "sync", "waiting_authorization")
@@ -131,19 +175,27 @@ class BackgroundSync:
         self.run_one_job()
 
     def schedule_snapshot(self):
+        self.cancel_disallowed_jobs()
         with self.sessions.begin() as db:
-            enqueue(db, "chats")
-            for topic in ("1", "2", "17", "18"):
-                enqueue(db, f"approvals:{topic}")
-            for chat_id in db.scalars(select(Chat.chat_id).where(Chat.visible)):
-                enqueue(db, f"messages:{chat_id}")
-            for thread_id in db.scalars(
-                select(Message.thread_id)
-                .join(Chat, Message.chat_id == Chat.chat_id)
-                .where(Chat.visible, Message.thread_id.is_not(None))
-                .distinct()
-            ):
-                enqueue(db, f"thread:{thread_id}")
+            if self.reminders_only:
+                enqueue(db, "approvals:1")
+                if self.dms_configured:
+                    enqueue(db, "dms_cards")
+                for code in db.scalars(self.reminder_instance_codes()):
+                    enqueue(db, f"instance:{code}")
+            else:
+                enqueue(db, "chats")
+                for topic in ("1", "2", "17", "18"):
+                    enqueue(db, f"approvals:{topic}")
+                for chat_id in db.scalars(select(Chat.chat_id).where(Chat.visible)):
+                    enqueue(db, f"messages:{chat_id}")
+                for thread_id in db.scalars(
+                    select(Message.thread_id)
+                    .join(Chat, Message.chat_id == Chat.chat_id)
+                    .where(Chat.visible, Message.thread_id.is_not(None))
+                    .distinct()
+                ):
+                    enqueue(db, f"thread:{thread_id}")
             # Retain only event IDs and resource hints, never event message bodies.
             db.execute(
                 delete(EventInbox).where(EventInbox.processed_at < utcnow() - timedelta(days=7))
@@ -160,7 +212,16 @@ class BackgroundSync:
             )
             for event in events:
                 chat_id = event.hints.get("chat_id")
-                if chat_id:
+                if self.reminders_only:
+                    # Bot-visible ordinary chats are not a reason to collect
+                    # conversations. Only the configured DBA source is relevant.
+                    if chat_id and self.dms_configured and chat_id == self.settings.dms_chat_id:
+                        enqueue(db, "dms_cards", changed=True)
+                    event.hints = {
+                        key: value for key, value in event.hints.items()
+                        if key not in {"chat_lookup_pending", "chat_lookup_retried"}
+                    }
+                elif chat_id:
                     chat = db.get(Chat, chat_id)
                     # Bot-visible chats may not belong to this user. Never copy their content.
                     if chat and chat.visible:
@@ -171,16 +232,22 @@ class BackgroundSync:
                         event.hints = {**event.hints, "chat_lookup_pending": True}
                     enqueue(db, "chats", changed=True)
                 if event.event_type.startswith("approval."):
-                    for topic in ("1", "2", "17", "18"):
+                    for topic in (("1",) if self.reminders_only else ("1", "2", "17", "18")):
                         enqueue(db, f"approvals:{topic}", changed=True)
                     code = event.hints.get("instance_code")
-                    if code and db.scalar(
-                        select(ApprovalTask).where(ApprovalTask.instance_code == code).limit(1)
-                    ):
+                    known = (
+                        code in set(db.scalars(self.reminder_instance_codes()))
+                        if code and self.reminders_only else bool(code and db.scalar(
+                            select(ApprovalTask).where(ApprovalTask.instance_code == code).limit(1)
+                        ))
+                    )
+                    if known:
                         enqueue(db, f"instance:{code}", changed=True)
                 event.processed_at = utcnow()
 
     def finish_chat_lookups(self, db):
+        if self.reminders_only:
+            return False
         retry = False
         for event in db.scalars(
             select(EventInbox).where(
@@ -206,6 +273,7 @@ class BackgroundSync:
         return retry
 
     def run_one_job(self):
+        self.cancel_disallowed_jobs()
         recent_message = (
             select(EventInbox.event_id)
             .where(
@@ -225,6 +293,7 @@ class BackgroundSync:
             .exists()
         )
         priority = case(
+            (SyncJob.resource == "dms_cards", 0),
             (
                 SyncJob.resource == f"messages:{getattr(self.settings, 'dms_chat_id', '')}"
                 if getattr(self.settings, "dms_sender_app_id", "") else False,
@@ -243,7 +312,10 @@ class BackgroundSync:
         with self.sessions() as db:
             job = db.scalar(
                 select(SyncJob)
-                .where(SyncJob.next_attempt_at <= utcnow())
+                .where(
+                    SyncJob.next_attempt_at <= utcnow(),
+                    self.reminder_job_filter() if self.reminders_only else True,
+                )
                 .order_by(priority, SyncJob.next_attempt_at, SyncJob.resource)
                 .limit(1)
             )
@@ -256,15 +328,18 @@ class BackgroundSync:
         except AppError as exc:
             with self.sessions.begin() as db:
                 current = db.get(SyncJob, job.resource)
-                current.attempts += 1
-                current.error_code = exc.code
-                current.next_attempt_at = utcnow() + timedelta(
-                    seconds=min(300, 5 * 2 ** min(current.attempts, 6))
-                )
+                if current:
+                    current.attempts += 1
+                    current.error_code = exc.code
+                    current.next_attempt_at = utcnow() + timedelta(
+                        seconds=min(300, 5 * 2 ** min(current.attempts, 6))
+                    )
             worker_status(self.sessions, "sync", "error", exc.code, resource=job.resource)
             return
         with self.sessions.begin() as db:
             current = db.get(SyncJob, job.resource)
+            if not current:
+                return
             retry_chat_lookup = (
                 job.resource == "chats" and not result["has_more"] and self.finish_chat_lookups(db)
             )
@@ -273,15 +348,16 @@ class BackgroundSync:
                 current.attempts, current.error_code = 0, None
             else:
                 db.delete(current)
-            if job.resource == "chats":
+            if job.resource == "chats" and not self.reminders_only:
                 for chat_id in db.scalars(select(Chat.chat_id).where(Chat.visible)):
                     enqueue(db, f"messages:{chat_id}")
             if job.resource.startswith("approvals:"):
                 topic = job.resource.split(":")[1]
-                for code in db.scalars(
+                codes = self.reminder_instance_codes() if self.reminders_only else (
                     select(ApprovalTask.instance_code)
                     .where(ApprovalTask.visible, ApprovalTask.topic == topic)
                     .distinct()
-                ):
+                )
+                for code in db.scalars(codes):
                     enqueue(db, f"instance:{code}")
         worker_status(self.sessions, "sync", "idle")

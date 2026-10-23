@@ -19,13 +19,14 @@ class Settings(BaseSettings):
     feishu_allowed_open_id: str = ""
     feishu_scopes: str = (
         "offline_access contact:user.base:readonly im:chat:read im:message:readonly "
-        "im:message.p2p_msg:get_as_user im:message.group_msg:get_as_user "
+        "im:message.p2p_msg:get_as_user im:message.group_msg:get_as_user search:message "
         "approval:task:read approval:instance:read approval:task:write"
     )
     sync_page_limit: int = Field(default=5, ge=1, le=20)
     http_timeout_seconds: float = Field(default=15, ge=1, le=60)
     session_hours: int = Field(default=24, ge=1, le=168)
     sync_interval_seconds: int = Field(default=60, ge=30, le=3600)
+    reminders_only: bool = True
     approval_automation_enabled: bool = True
     approval_policy_path: str = "approval-policy.json"
     approval_model_enabled: bool = True

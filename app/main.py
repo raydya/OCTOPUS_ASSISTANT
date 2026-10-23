@@ -241,6 +241,7 @@ def create_app(settings=None, *, transport=None):
                 "connection_mode": "websocket",
                 "authorization_mode": "device",
                 "sync_interval_seconds": settings.sync_interval_seconds,
+                "reminders_only": settings.reminders_only,
                 "workers": [
                     {
                         "name": w.name,
@@ -256,6 +257,10 @@ def create_app(settings=None, *, transport=None):
                             w.name in {"approval_model", "approval_review", "attention"}
                             and (utcnow() - w.heartbeat_at).total_seconds()
                             > settings.approval_model_timeout_seconds + 120
+                        ) or (
+                            w.name == "mentions"
+                            and (utcnow() - w.heartbeat_at).total_seconds()
+                            > max(60, settings.sync_interval_seconds) + 120
                         ),
                     }
                     for w in db.scalars(select(WorkerState))
@@ -530,14 +535,20 @@ def create_app(settings=None, *, transport=None):
 
     @app.post("/api/sync/chats", dependencies=[Depends(mutation)])
     def sync_chats(body: SyncBody):
+        if settings.reminders_only:
+            raise AppError("message_sync_disabled", "普通与历史消息同步已停用，仅读取提醒所需信息。", 403)
         return sync.run("chats", restart=body.restart)
 
     @app.post("/api/sync/messages/{chat_id}", dependencies=[Depends(mutation)])
     def sync_messages(chat_id: str, body: SyncBody):
+        if settings.reminders_only:
+            raise AppError("message_sync_disabled", "普通与历史消息同步已停用，仅读取提醒所需信息。", 403)
         return sync.run(f"messages:{chat_id}", days=body.days, restart=body.restart)
 
     @app.post("/api/sync/threads/{thread_id}", dependencies=[Depends(mutation)])
     def sync_thread(thread_id: str, body: SyncBody):
+        if settings.reminders_only:
+            raise AppError("message_sync_disabled", "普通与历史消息同步已停用，仅读取提醒所需信息。", 403)
         return sync.run(f"thread:{thread_id}", restart=body.restart)
 
     @app.post("/api/sync/approvals/{topic}", dependencies=[Depends(mutation)])

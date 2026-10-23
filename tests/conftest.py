@@ -28,6 +28,7 @@ def settings(tmp_path):
         feishu_app_id="cli_test",
         feishu_app_secret="test-app-secret",
         sync_page_limit=1,
+        reminders_only=False,
         app_base_url="http://localhost:8000",
         approval_policy_path=str(policy),
         approval_model_enabled=False,

@@ -187,7 +187,7 @@ class AttentionService:
         self.started_at = utcnow()
         self.approvals = ApprovalAttentionSource(settings, sessions, feishu)
         self.dms = DmsCardAttentionSource(settings, sessions, feishu, clock=lambda: utcnow())
-        self._dms_history_pending = self.dms.configured
+        self._dms_history_pending = self.dms.configured and not getattr(settings, "reminders_only", True)
 
     def tick(self):
         if not getattr(self.settings, "attention_enabled", False):
@@ -273,6 +273,9 @@ class AttentionService:
 
     def _discover_dms_history(self):
         """Include already cached DMS cards when this source is first enabled."""
+        if getattr(self.settings, "reminders_only", True):
+            self._dms_history_pending = False
+            return
         if not self._dms_history_pending:
             return
         with self.sessions.begin() as db:

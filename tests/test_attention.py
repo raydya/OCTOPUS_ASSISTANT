@@ -107,6 +107,7 @@ def system(database, monkeypatch):
     monkeypatch.setattr(attention, "utcnow", lambda: clock.now)
     settings = SimpleNamespace(
         attention_enabled=True, attention_timeout_seconds=900,
+        reminders_only=False,
         attention_call_cooldown_seconds=1800, feishu_app_id="cli_test",
         approval_model_timeout_seconds=180,
     )
