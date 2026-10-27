@@ -54,11 +54,7 @@ def test_yesterdays_late_mention_does_not_send_new_receipt_or_restart_dm(
         tracked = db.get(MessageAttention, "om_mention")
         assert tracked.status == "skipped_restart"
     assert not phone.sent and not phone.calls and not model.calls
-    bad_notices = [
-        text for text, _, _ in notices.feishu.sent
-        if "已收到，等待判断" in text or "服务恢复时已超过提醒期限" in text
-    ]
-    assert not bad_notices, "A day-old late sync generated new-receipt/restart status DMs"
+    assert not notices.feishu.sent, "A day-old late sync generated new-receipt/restart status DMs"
 
 
 def test_fresh_mention_still_sends_receipt_then_actual_judgment(notices, monkeypatch):

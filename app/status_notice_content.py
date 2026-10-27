@@ -11,6 +11,18 @@ import json
 import re
 from urllib.parse import urlencode, urlsplit
 
+from app.status_cards import (
+    approval_button,
+    attach_card,
+    brief_reason,
+    chat_button,
+    dms_button,
+    dms_title,
+)
+from app.status_cards import card_fingerprint as card_fingerprint
+from app.status_cards import compact_text as compact_text
+from app.status_cards import status_card as status_card
+
 
 def _get(value, key, default=None):
     return value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
@@ -90,7 +102,11 @@ def dms_received_notice(payload, *, base_url="", chat_id=""):
         *_links(base_url, chat_id),
     ])
     notice["revision"] = dms_receipt_revision(payload["source_id"])
-    return notice
+    projected = _mapping(payload.get("card"))
+    return attach_card(
+        notice, title=projected.get("title") or dms_title({}, payload["title"]),
+        status="⏳ 正在核验", button=projected.get("button") or chat_button(chat_id),
+    )
 
 
 def _judgment_lines(model, reasons=()):
@@ -275,11 +291,25 @@ def approval_notice(
     if show_judgment:
         lines.extend(_judgment_lines(model, reasons))
     lines.extend([f"下一步：{next_step}", *_links(base_url)])
-    return _notice("approval", task_id, phase, title, lines, terminal=terminal)
+    notice = _notice("approval", task_id, phase, title, lines, terminal=terminal)
+    display_status = {
+        "received": "⏳ 正在核验", "assessing": "⏳ 正在核验",
+        "waiting": "⏳ 待提交审批", "needs_human": "🔔 待你处理",
+        "submitting": "⏳ 正在提交，结果未确认", "submission_unknown": "⚠️ 提交结果未确认",
+        "approved": "✅ 已通过", "responded": "ℹ️ 已不在当前待办",
+        "held": "⏸ 已暂缓", "error": "⚠️ 核验或执行受阻",
+    }[phase]
+    if phase == "error" and execution == "blocked_permission":
+        display_status = "⚠️ 权限不足，尚未提交"
+    detail = brief_reason(model.get("questions"), model.get("reasons"), reasons) if phase in {"error", "needs_human"} else ""
+    return attach_card(
+        notice, title=_short(_get(task, "title"), 180) or "审批申请", status=display_status,
+        detail=detail, button=approval_button(_get(task, "instance_code")),
+    )
 
 
 def _message_received(message_id, chat_name, text, chat_id, base_url):
-    return _notice(
+    notice = _notice(
         "message", message_id, "received", "收到 @ 你的消息：" + (_short(chat_name, 160) or "飞书会话"),
         [
             "当前状态：已收到，等待判断重要性与是否需要你响应。",
@@ -287,6 +317,10 @@ def _message_received(message_id, chat_name, text, chat_id, base_url):
             "下一步：判断完成后会私信告知；明确重要且需要响应的消息仍按原 15 分钟规则电话提醒。",
             *_links(base_url, chat_id),
         ],
+    )
+    return attach_card(
+        notice, title="@ 我 · " + (_short(chat_name, 160) or "飞书会话"),
+        status="⏳ 正在判断", button=chat_button(chat_id),
     )
 
 
@@ -298,7 +332,7 @@ def mention_received_notice(message, chat, *, base_url=""):
     )
 
 
-def attention_notice(row, *, base_url=""):
+def attention_notice(row, *, base_url="", source_url=""):
     """Project explicit mentions or DMS cards; native approvals use their review."""
     source_type = _get(row, "source_type", "message")
     if source_type not in {"message", "dms_card"}:
@@ -393,4 +427,38 @@ def attention_notice(row, *, base_url=""):
     if dms:
         lines.append("处理边界：仅提醒，不自动审批 DMS。")
     lines.extend([f"下一步：{next_step}", *_links(base_url, _get(row, "chat_id"))])
-    return _notice(source_type, _get(row, "message_id"), phase, title, lines, terminal=terminal)
+    notice = _notice(source_type, _get(row, "message_id"), phase, title, lines, terminal=terminal)
+    display_status = {
+        "received": "⏳ 正在核验" if dms else "⏳ 正在判断",
+        "assessing": "⏳ 正在核验", "needs_human": "🔔 待你审批",
+        "waiting": "🔔 重要消息，待你响应", "acknowledged": "⏸ 已停止提醒",
+        "responded": "ℹ️ 已停止提醒", "error": "⚠️ 暂时无法核验",
+        "normal": "ℹ️ 无需电话提醒", "reminding": "⏳ 正在发送提醒",
+        "submission_unknown": "⚠️ 提醒提交结果未确认",
+        "phone_accepted": "📞 电话提醒已受理",
+    }[phase]
+    if phase == "responded" and dms:
+        display_status = {
+            "approved": "✅ 已通过", "rejected": "❌ 已拒绝", "cancelled": "↩️ 已撤销",
+        }.get(source.get("card_status"), "ℹ️ 已停止提醒，处理状态未确认")
+    elif phase == "normal" and not dms:
+        display_status = (
+            "💬 普通消息，仍需回复" if model.get("requires_response") is True
+            else "ℹ️ 无需响应" if model.get("requires_response") is False
+            else "ℹ️ 无需电话提醒"
+        )
+    elif status == "source_changed":
+        display_status = "⏳ 正在重新核验"
+    elif status == "skipped_restart":
+        display_status = "ℹ️ 已过提醒期限"
+    elif status == "calling":
+        display_status = "⏳ 正在提交电话提醒"
+    elif status == "phone_unknown":
+        display_status = "⚠️ 电话提交结果未确认"
+    detail = brief_reason(_get(row, "reasons", []), model.get("questions")) if phase == "error" else ""
+    return attach_card(
+        notice,
+        title=dms_title(source, title) if dms else "@ 我 · " + (_short(_get(row, "chat_name"), 160) or "飞书会话"),
+        status=display_status, detail=detail,
+        button=dms_button(source_url, _get(row, "chat_id")) if dms else chat_button(_get(row, "chat_id")),
+    )

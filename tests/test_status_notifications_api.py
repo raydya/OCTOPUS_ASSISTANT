@@ -85,8 +85,11 @@ def test_status_exposes_notification_switch_and_delivery_counts(make_app, settin
         db.add_all([
             _notification("sent", "sent"),
             _notification("unknown", "unknown"),
+            _notification("blocked_unknown", "blocked_unknown"),
             _notification("queued", "queued"),
             _notification("permission", "blocked_permission"),
+            _notification("failed", "failed"),
+            _notification("foreign_failed", "failed", owner="ou_other"),
             _notification("superseded", "superseded"),
         ])
     with TestClient(app, base_url="http://localhost:8000") as client:
@@ -94,5 +97,5 @@ def test_status_exposes_notification_switch_and_delivery_counts(make_app, settin
         response = client.get("/api/status")
         assert response.status_code == 200
         assert response.json()["status_notifications"] == {
-            "enabled": enabled, "sent": 1, "pending": 2, "unknown": 1,
+            "enabled": enabled, "sent": 1, "pending": 2, "unknown": 2, "failed": 1,
         }

@@ -11,7 +11,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
-from sqlalchemy import or_, select, text, tuple_, update
+from sqlalchemy import func, or_, select, text, tuple_, update
 
 from app.attention import is_personal_mention, source_hash
 from app.dms_attention import (
@@ -41,10 +41,11 @@ from app.models import (
 from app.status_notice_content import (
     approval_notice,
     attention_notice,
+    compact_text,
     dms_receipt_revision,
     dms_received_notice,
     mention_received_notice,
-    status_message_text,
+    status_card,
 )
 
 LOCK_ID = 81024006
@@ -57,10 +58,15 @@ def source_key(owner, kind, identifier):
     return hashlib.sha256(json.dumps([owner, kind, identifier]).encode()).hexdigest()
 
 
+def _source_revision(row):
+    return row.source_revision or row.revision
+
+
 def notification_view(row):
     return {key: getattr(row, key) for key in (
         "id", "source_key", "phase", "text", "status", "submitted_at", "sent_at",
         "message_id", "error_code", "created_at", "updated_at",
+        "delivery_action",
     )}
 
 
@@ -270,32 +276,53 @@ class StatusNotificationService:
             StatusNotification.submitted_at.is_(None),
             # Status changes may replace an unsent conclusion, but the initial
             # receipt remains a separate, durable step in the notification flow.
-            StatusNotification.revision != dms_receipt_revision(source.source_id),
+            func.coalesce(StatusNotification.source_revision, StatusNotification.revision)
+            != dms_receipt_revision(source.source_id),
         ).values(status="superseded", updated_at=utcnow()))
         if baseline or not source.notify_changes and not submitted_result:
             return
         if receipt:
             db.add(StatusNotification(
                 id=str(uuid4()), source_key=key, owner_open_id=owner,
-                revision=receipt["revision"], phase=receipt["phase"], text=receipt["text"],
+                revision=receipt["revision"], phase=receipt["phase"], text=compact_text(receipt),
+                source_revision=receipt["revision"],
+                delivery_action="pending", card_payload=status_card(receipt),
                 status="queued", created_at=utcnow(), updated_at=utcnow(),
             ))
         # Reobserving an old outcome after a retry/restart must not resend it.
         existing = db.scalar(select(StatusNotification).where(
             StatusNotification.source_key == key,
-            StatusNotification.revision == payload["revision"],
-        ))
+            or_(
+                StatusNotification.source_revision == payload["revision"],
+                StatusNotification.source_revision.is_(None)
+                & (StatusNotification.revision == payload["revision"]),
+            ),
+        ).order_by(StatusNotification.created_at.desc(), StatusNotification.id.desc()).limit(1))
+        delivery_revision = payload["revision"]
         if existing:
-            if (
+            if existing.delivery_action == "legacy" or (
+                existing.status == "sent" and source.card_create_state == "ready"
+                and source.card_sent_revision != payload["revision"]
+            ):
+                # A card reflects current state, so A -> B -> A needs another
+                # PATCH. Keep prior delivery evidence (including legacy text)
+                # and give this occurrence its own delivery identity.
+                delivery_revision = hashlib.sha256(f'{payload["revision"]}:{uuid4()}'.encode()).hexdigest()
+            elif (
                 existing.submitted_at is None and existing.status == "superseded"
                 and existing.error_code != MESSAGE_EXPIRED
+                and existing.delivery_action != "legacy"
             ):
                 existing.status, existing.error_code, existing.next_attempt_at = "queued", None, None
                 existing.updated_at = utcnow()
-            return
+                return
+            else:
+                return
         db.add(StatusNotification(
             id=str(uuid4()), source_key=key, owner_open_id=owner,
-            revision=payload["revision"], phase=payload["phase"], text=payload["text"],
+            revision=delivery_revision, source_revision=payload["revision"],
+            phase=payload["phase"], text=compact_text(payload),
+            delivery_action="pending", card_payload=status_card(payload),
             status="queued", created_at=utcnow(), updated_at=utcnow(),
         ))
 
@@ -370,6 +397,18 @@ class StatusNotificationService:
                 StatusNotification.status == "sending",
                 StatusNotification.owner_open_id == owner.open_id,
             ).values(status="unknown", error_code="status_send_interrupted", updated_at=utcnow()))
+            db.execute(update(StatusNoticeSource).where(
+                StatusNoticeSource.owner_open_id == owner.open_id,
+                StatusNoticeSource.card_create_state == "submitting",
+            ).values(card_create_state="unknown"))
+            # Old workers may have queued text during a rolling upgrade. Keep
+            # its audit row but do not replay it or turn it into a new card.
+            db.execute(update(StatusNotification).where(
+                StatusNotification.owner_open_id == owner.open_id,
+                StatusNotification.delivery_action == "legacy",
+                StatusNotification.status.in_(UNSENT),
+                StatusNotification.submitted_at.is_(None),
+            ).values(status="superseded", error_code="status_legacy_migrated", updated_at=utcnow()))
             self._discover(db, state)
             ids = db.scalars(select(StatusNotification.id).where(
                 StatusNotification.owner_open_id == owner.open_id,
@@ -406,7 +445,7 @@ class StatusNotificationService:
                 return False
             if not owner or not state or row.owner_open_id != owner.open_id or state.owner_open_id != owner.open_id:
                 raise AppError("status_owner_changed", "即时私信绑定的账号不一致。", 409)
-            source = db.get(StatusNoticeSource, row.source_key)
+            source = db.get(StatusNoticeSource, row.source_key, with_for_update=True)
             latest = self._refresh(db, source, owner.open_id) if source else None
             if source and source.source_type == "message" and latest:
                 submitted_result = latest.get("submitted_result") is True
@@ -422,10 +461,10 @@ class StatusNotificationService:
                     return False
             is_receipt = bool(
                 source and source.source_type == "dms_card"
-                and row.revision == dms_receipt_revision(source.source_id)
+                and _source_revision(row) == dms_receipt_revision(source.source_id)
             )
             if not latest or not is_receipt and (
-                latest["revision"] != row.revision or source.revision != row.revision
+                latest["revision"] != _source_revision(row) or source.revision != _source_revision(row)
             ):
                 row.status, row.updated_at = "superseded", utcnow()
                 self._observe(db, owner.open_id, latest)
@@ -433,7 +472,8 @@ class StatusNotificationService:
             if source.source_type == "dms_card" and not is_receipt:
                 receipt = db.scalar(select(StatusNotification).where(
                     StatusNotification.source_key == source.key,
-                    StatusNotification.revision == dms_receipt_revision(source.source_id),
+                    func.coalesce(StatusNotification.source_revision, StatusNotification.revision)
+                    == dms_receipt_revision(source.source_id),
                 ))
                 if receipt and receipt.submitted_at is None and receipt.status in UNSENT:
                     return False
@@ -441,22 +481,111 @@ class StatusNotificationService:
                 # Revalidate the trusted source immediately before sending,
                 # while allowing its current business state to have advanced.
                 self._observe(db, owner.open_id, latest)
-            row.text = status_message_text(row.text)
+            if row.delivery_action == "legacy":
+                row.status, row.error_code = "superseded", "status_legacy_migrated"
+                row.updated_at = utcnow()
+                return False
+            if source.card_create_state in {"submitting", "unknown"}:
+                row.status, row.error_code = "blocked_unknown", "status_card_create_unknown"
+                row.updated_at = utcnow()
+                return False
+            if source.card_create_state == "ready":
+                blocker = db.scalar(select(StatusNotification).where(
+                    StatusNotification.source_key == source.key,
+                    StatusNotification.delivery_action == "update",
+                    StatusNotification.status.in_(["sending", "unknown", "failed"]),
+                ).order_by(StatusNotification.created_at).limit(1))
+                if blocker:
+                    row.status = "failed" if blocker.status == "failed" else "blocked_unknown"
+                    row.error_code = blocker.error_code if blocker.status == "failed" else "status_card_update_unknown"
+                    row.updated_at = utcnow()
+                    return False
+                if not source.card_message_id or not source.card_receipt:
+                    row.status, row.error_code = "failed", "status_card_unverified"
+                    row.updated_at = utcnow()
+                    return False
+                action, target, receipt = "update", source.card_message_id, dict(source.card_receipt)
+            elif source.card_create_state == "none" and not source.card_message_id and not source.card_receipt:
+                action, target, receipt = "create", None, None
+                source.card_create_state = "submitting"
+            else:
+                row.status, row.error_code = "failed", "status_card_unverified"
+                row.updated_at = utcnow()
+                return False
+            payload = dms_received_notice(
+                latest, base_url=self.settings.app_base_url, chat_id=self.dms.chat_id,
+            ) if is_receipt else latest
+            row.text, row.card_payload = compact_text(payload), status_card(payload)
+            row.delivery_action, row.message_id = action, target
             row.status, row.submitted_at, row.updated_at = "sending", utcnow(), utcnow()
             row.error_code, row.next_attempt_at = None, None
-            message, expected_owner = row.text, row.owner_open_id
+            card, expected_owner = row.card_payload, row.owner_open_id
         try:
-            result = self.feishu.send_self_status(message, identifier, expected_owner=expected_owner)
+            if action == "create":
+                result = self.feishu.send_self_status_card(card, identifier, expected_owner=expected_owner)
+            else:
+                result = self.feishu.update_self_status_card(
+                    target, card, expected_owner=expected_owner, expected_receipt=receipt,
+                )
             message_id = result.get("message_id") if isinstance(result, dict) else None
             if not isinstance(message_id, str) or not re.fullmatch(r"om_[A-Za-z0-9_-]{1,124}", message_id):
-                raise AppError("status_response_invalid", "私信发送结果无法确认。")
+                raise AppError("status_response_invalid", "状态卡片写入结果无法确认。")
+            if action == "update" and message_id != target:
+                raise AppError("status_response_invalid", "卡片更新标识与已保存锚点不一致。")
+            if action == "create":
+                receipt = result.get("receipt")
+                if (
+                    not isinstance(receipt, dict) or receipt.get("message_id") != message_id
+                    or receipt.get("owner_open_id") != expected_owner
+                    or receipt.get("sender_app_id") != self.settings.feishu_app_id
+                    or receipt.get("msg_type") != "interactive"
+                    or not isinstance(receipt.get("chat_id"), str)
+                    or not re.fullmatch(r"oc_[A-Za-z0-9_-]{1,124}", receipt["chat_id"])
+                    or not re.fullmatch(r"[0-9]{1,15}", str(receipt.get("create_time", "")))
+                    or int(receipt["create_time"]) <= 0
+                ):
+                    raise AppError("status_response_invalid", "状态卡片的创建回执不完整。")
         except Exception as exc:
-            with self.sessions.begin() as db:
-                row = db.get(StatusNotification, identifier, with_for_update=True)
-                row.status, row.error_code, row.updated_at = "unknown", _safe_error(exc), utcnow()
+            self._failed_delivery(identifier, exc)
             return False
+        # A database failure here must leave the submitted marker intact. The
+        # next owner-locked tick recovers it as unknown, never a second create.
+        self._complete_delivery(identifier, message_id, receipt)
+        return True
+
+    def _failed_delivery(self, identifier, exc):
         with self.sessions.begin() as db:
             row = db.get(StatusNotification, identifier, with_for_update=True)
+            source = db.get(StatusNoticeSource, row.source_key, with_for_update=True)
+            if getattr(exc, "write_attempted", None) is False:
+                retryable = getattr(exc, "retryable", False) is True
+                row.status = "queued" if retryable else "failed"
+                row.submitted_at = None
+                row.next_attempt_at = utcnow() + timedelta(seconds=60) if retryable else None
+                if row.delivery_action == "create" and source.card_create_state == "submitting":
+                    source.card_create_state = "none"
+            else:
+                row.status = "unknown"
+                if row.delivery_action == "create":
+                    source.card_create_state = "unknown"
+            row.error_code, row.updated_at = _safe_error(exc), utcnow()
+
+    def _complete_delivery(self, identifier, message_id, receipt):
+        with self.sessions.begin() as db:
+            row = db.get(StatusNotification, identifier, with_for_update=True)
+            source = db.get(StatusNoticeSource, row.source_key, with_for_update=True)
+            owner = db.get(Account, 1)
+            if not owner or source.owner_open_id != owner.open_id or row.owner_open_id != owner.open_id:
+                raise AppError("status_owner_changed", "即时私信绑定的账号不一致。", 409)
+            if row.status != "sending" or row.submitted_at is None:
+                raise AppError("status_delivery_changed", "状态卡片提交记录已变化。", 409)
+            if row.delivery_action == "create":
+                if source.card_create_state != "submitting" or source.card_message_id:
+                    raise AppError("status_delivery_changed", "状态卡片锚点已变化。", 409)
+                source.card_create_state, source.card_message_id = "ready", message_id
+                source.card_receipt = dict(receipt)
+            elif source.card_create_state != "ready" or source.card_message_id != message_id:
+                raise AppError("status_delivery_changed", "状态卡片锚点已变化。", 409)
+            source.card_sent_revision = _source_revision(row)
             row.status, row.message_id = "sent", message_id
             row.sent_at = row.updated_at = utcnow()
-        return True

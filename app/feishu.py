@@ -8,11 +8,21 @@ import httpx
 from sqlalchemy import select
 
 from app.errors import AppError, FeishuError
-from app.models import Account, utcnow
+from app.models import Account, StatusNoticeSource, utcnow
 
 API_BASE = "https://open.feishu.cn/open-apis"
 DEVICE_URL = "https://accounts.feishu.cn/oauth/v1/device_authorization"
 TOKEN_PATH = "https://accounts.feishu.cn/oauth/v3/token"
+
+
+class StatusCardPreflightError(AppError):
+    """A status-message POST/PATCH has definitely not been attempted."""
+
+    write_attempted = False
+
+    def __init__(self, code, message, status=409, *, retryable=False):
+        super().__init__(code, message, status)
+        self.retryable = retryable
 
 
 class FeishuClient:
@@ -441,6 +451,169 @@ class FeishuClient:
         if not re.fullmatch(r"om_[A-Za-z0-9_-]{1,128}", data["message_id"]):
             raise FeishuError("invalid_status_response")
         return data
+
+    @staticmethod
+    def _status_card_content(card):
+        if (
+            not isinstance(card, dict) or not isinstance(card.get("config"), dict)
+            or card["config"].get("update_multi") is not True
+        ):
+            raise StatusCardPreflightError("invalid_status_card", "状态卡片必须启用共享更新。", 422)
+        try:
+            content = json.dumps(card, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            content_size = len(content.encode("utf-8"))
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            raise StatusCardPreflightError("invalid_status_card", "状态卡片内容无效。", 422) from None
+        if content_size > 30 * 1024:
+            raise StatusCardPreflightError("invalid_status_card", "状态卡片超过 30 KB。", 422)
+        return content
+
+    def _status_card_owner(self, expected_owner):
+        if not isinstance(expected_owner, str) or not re.fullmatch(r"ou_[A-Za-z0-9_-]{1,128}", expected_owner):
+            raise StatusCardPreflightError("status_owner_changed", "状态卡片收件人无法核实。")
+        with self.sessions() as db:
+            account = db.get(Account, 1)
+            if not account:
+                raise StatusCardPreflightError("connect_required", "请先连接飞书账号。", retryable=True)
+            if account.open_id != expected_owner:
+                raise StatusCardPreflightError("status_owner_changed", "状态卡片收件人与绑定账号不一致。")
+        return expected_owner
+
+    def _status_card_token(self, *, updating=False):
+        credentials = self._attention_credentials()
+        granted = set(credentials.get("scope", "").split())
+        if updating:
+            allowed = bool(granted & {"im:message", "im:message:update", "im:message:send_as_bot"})
+            allowed = allowed and bool(granted & {"im:message", "im:message:readonly", "im:message.history:readonly"})
+        else:
+            allowed = bool(granted & {"im:message", "im:message:send", "im:message:send_as_bot"})
+        if not allowed:
+            raise StatusCardPreflightError(
+                "status_card_permission_required" if updating else "self_message_permission_required",
+                "请在飞书后台开通应用身份的消息权限并发布。", retryable=True,
+            )
+        return credentials["access_token"]
+
+    def _status_card_response(self, data, owner):
+        """Validate an outbound receipt; no business-source message ID is reused."""
+        sender = data.get("sender") if isinstance(data, dict) else None
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("message_id"), str)
+            or not re.fullmatch(r"om_[A-Za-z0-9_-]{1,128}", data["message_id"])
+            or not isinstance(data.get("chat_id"), str)
+            or not re.fullmatch(r"oc_[A-Za-z0-9_-]{1,128}", data["chat_id"])
+            or data.get("msg_type") != "interactive" or data.get("deleted") is not False
+            or data.get("chat_type") not in (None, "p2p")
+            or not isinstance(sender, dict) or sender.get("id") != self.settings.feishu_app_id
+            or sender.get("id_type") != "app_id" or sender.get("sender_type") != "app"
+        ):
+            raise FeishuError("invalid_status_card_response")
+        created = data.get("create_time")
+        if (
+            not isinstance(created, str) or not re.fullmatch(r"[0-9]{1,15}", created)
+            or not 0 < int(created) <= int((utcnow() + timedelta(minutes=5)).timestamp() * 1000)
+        ):
+            raise FeishuError("invalid_status_card_response")
+        return {
+            "message_id": data["message_id"], "chat_id": data["chat_id"],
+            "msg_type": "interactive", "owner_open_id": owner,
+            "sender_app_id": self.settings.feishu_app_id, "create_time": str(int(created)),
+        }
+
+    def _status_card_receipt(self, message_id, expected_owner, expected_receipt):
+        if (
+            not isinstance(message_id, str) or not re.fullmatch(r"om_[A-Za-z0-9_-]{1,128}", message_id)
+            or not isinstance(expected_receipt, dict)
+            or expected_receipt.get("message_id") != message_id
+            or expected_receipt.get("owner_open_id") != expected_owner
+            or expected_receipt.get("sender_app_id") != self.settings.feishu_app_id
+            or expected_receipt.get("msg_type") != "interactive"
+            or not isinstance(expected_receipt.get("chat_id"), str)
+            or not re.fullmatch(r"oc_[A-Za-z0-9_-]{1,128}", expected_receipt["chat_id"])
+        ):
+            raise StatusCardPreflightError("status_card_unverified", "无法核实状态卡片的发送记录。")
+        self._status_card_owner(expected_owner)
+        with self.sessions() as db:
+            sources = list(db.scalars(select(StatusNoticeSource).where(
+                StatusNoticeSource.card_message_id == message_id,
+                StatusNoticeSource.owner_open_id == expected_owner,
+                StatusNoticeSource.card_create_state == "ready",
+            ).limit(2)))
+            if len(sources) != 1 or sources[0].card_receipt != expected_receipt:
+                raise StatusCardPreflightError("status_card_unverified", "状态卡片不属于已确认的本人通知。")
+
+    @staticmethod
+    def _status_card_preflight_failure(exc):
+        if isinstance(exc, StatusCardPreflightError):
+            return exc
+        if isinstance(exc, FeishuError) and exc.provider_code in {"230011", "230110"}:
+            return StatusCardPreflightError("status_card_deleted", "原状态卡片已删除或撤回，停止更新。")
+        if isinstance(exc, FeishuError) and exc.provider_code == "230031":
+            return StatusCardPreflightError("status_card_expired", "原状态卡片已超过飞书允许的更新期限。")
+        if isinstance(exc, AppError):
+            return StatusCardPreflightError(exc.code, exc.message, exc.status, retryable=True)
+        return StatusCardPreflightError(
+            "status_card_preflight_unavailable", "暂时无法核验状态卡片，稍后重试。", 503, retryable=True,
+        )
+
+    def send_self_status_card(self, card: dict, uuid: str, *, expected_owner: str) -> dict:
+        try:
+            content = self._status_card_content(card)
+            if not isinstance(uuid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,50}", uuid):
+                raise StatusCardPreflightError("invalid_status_message", "状态卡片去重标识无效。", 422)
+            self._status_card_owner(expected_owner)
+            token = self._status_card_token()
+            owner = self._status_card_owner(expected_owner)
+        except Exception as exc:
+            raise self._status_card_preflight_failure(exc) from None
+        # POST happens once. A missing/malformed response is ambiguous and must
+        # retain the caller's durable submission marker, never create a new card.
+        body = self._request(
+            "POST", "/im/v1/messages", params={"receive_id_type": "open_id"},
+            headers={"Authorization": f"Bearer {token}"},
+            json={"receive_id": owner, "msg_type": "interactive", "content": content, "uuid": uuid},
+        )
+        receipt = self._status_card_response(body.get("data"), owner)
+        return {"message_id": receipt["message_id"], "receipt": receipt}
+
+    def update_self_status_card(
+        self, message_id: str, card: dict, *, expected_owner: str, expected_receipt: dict,
+    ) -> dict:
+        try:
+            content = self._status_card_content(card)
+            self._status_card_receipt(message_id, expected_owner, expected_receipt)
+            token = self._status_card_token(updating=True)
+            body = self._request(
+                "GET", f"/im/v1/messages/{message_id}", params={"user_id_type": "open_id"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            rows = (body.get("data") or {}).get("items")
+            matches = [row for row in rows if isinstance(row, dict) and row.get("message_id") == message_id] if isinstance(rows, list) else []
+            if len(matches) != 1:
+                raise StatusCardPreflightError("status_card_unverified", "状态卡片查询结果无法核实。")
+            if matches[0].get("deleted") is True:
+                raise StatusCardPreflightError("status_card_deleted", "原状态卡片已删除或撤回，停止更新。")
+            try:
+                verified = self._status_card_response(matches[0], expected_owner)
+            except FeishuError:
+                raise StatusCardPreflightError("status_card_unverified", "原状态卡片的发送身份无法核实。") from None
+            if verified != expected_receipt:
+                raise StatusCardPreflightError("status_card_unverified", "原状态卡片与持久发送记录不一致。")
+            if int(verified["create_time"]) <= int((utcnow() - timedelta(days=14)).timestamp() * 1000):
+                raise StatusCardPreflightError("status_card_expired", "原状态卡片已超过飞书允许的 14 天更新期限。")
+            # Token/GET calls can take time. Recheck the persisted recipient and
+            # receipt immediately before PATCH, without using a user credential.
+            self._status_card_receipt(message_id, expected_owner, expected_receipt)
+        except Exception as exc:
+            raise self._status_card_preflight_failure(exc) from None
+        body = self._request(
+            "PATCH", f"/im/v1/messages/{message_id}",
+            headers={"Authorization": f"Bearer {token}"}, json={"content": content},
+        )
+        if body.get("code") != 0 or not isinstance(body.get("data"), dict):
+            raise FeishuError("invalid_status_card_response")
+        return {"message_id": message_id}
 
     def _send_bot_text(
         self, owner: str, token: str, message: str, uuid: str,

@@ -43,6 +43,10 @@ class FakeStatusFeishu:
         self.sent = []
         self.before_send = None
         self.send_error = None
+        self.created_cards = []
+        self.updated_cards = []
+        self.notice_for_send = None
+        self.now = utcnow
 
     def self_message_permissions(self):
         return {
@@ -58,6 +62,24 @@ class FakeStatusFeishu:
         if self.send_error:
             raise self.send_error
         return {"message_id": f"om_status_{len(self.sent)}"}
+
+    def send_self_status_card(self, card, uuid, *, expected_owner):
+        self.created_cards.append((deepcopy(card), uuid, expected_owner))
+        notice = self.notice_for_send(uuid) if self.notice_for_send else None
+        result = self.send_self_status(notice.text if notice else str(card), uuid, expected_owner=expected_owner)
+        return {**result, "receipt": {
+            "message_id": result["message_id"], "chat_id": "oc_owner_dm",
+            "owner_open_id": expected_owner, "sender_app_id": "cli_test",
+            "msg_type": "interactive", "create_time": str(int(self.now().timestamp() * 1000)),
+        }}
+
+    def update_self_status_card(self, message_id, card, *, expected_owner, expected_receipt):
+        assert expected_receipt["message_id"] == message_id
+        assert expected_receipt["owner_open_id"] == expected_owner
+        self.updated_cards.append((message_id, deepcopy(card), deepcopy(expected_receipt)))
+        notice = self.notice_for_send(None)
+        self.send_self_status(notice.text, notice.id, expected_owner=expected_owner)
+        return {"message_id": message_id}
 
     def send_self_reminder(self, *args, **kwargs):
         pytest.fail("Status delivery must not submit an overdue reminder")
@@ -84,6 +106,15 @@ def notices(database, monkeypatch):
     )
     sessions = sessionmaker(database, expire_on_commit=False)
     feishu = FakeStatusFeishu()
+    feishu.now = lambda: clock.now
+
+    def notice_for_send(identifier):
+        with sessions() as db:
+            if identifier:
+                return db.get(StatusNotification, identifier)
+            return db.scalar(select(StatusNotification).where(StatusNotification.status == "sending"))
+
+    feishu.notice_for_send = notice_for_send
     with sessions.begin() as db:
         db.add(Account(
             id=1, open_id="ou_owner", tenant_key="tenant", name="本人",
@@ -274,7 +305,7 @@ def test_personal_mention_is_reported_before_model_assessment(notices):
     notices.service.tick()
     assert len(notices.feishu.sent) == 1
     text, _, owner = notices.feishu.sent[0]
-    assert owner == "ou_owner" and "业务群" in text and IMPORTANT in text
+    assert owner == "ou_owner" and "业务群" in text and "正在判断" in text
     with notices.sessions() as db:
         assert db.get(MessageAttention, "om_mention") is None
     assert notice_rows(notices)[0].status == "sent"
@@ -325,7 +356,7 @@ def test_judgment_change_reports_both_important_and_ordinary_mentions_once(notic
     add_attention(notices, important=important)
     notices.service.tick()
     assert len(notices.feishu.sent) == 2
-    expected = "需要立即处理服务故障。" if important else "常规同步，无需立即回复。"
+    expected = "重要消息，待你响应" if important else "无需响应"
     assert expected in sent_texts(notices)[-1]
     for _ in range(3):
         notices.clock.now += timedelta(seconds=1)
@@ -374,8 +405,8 @@ def test_model_recommendation_to_approve_is_not_reported_as_success(notices):
         review.execution_status = "awaiting_review"
     notices.service.tick()
     assert len(notices.feishu.sent) == 1
-    assert "尚未确认" in sent_texts(notices)[0]
-    assert "任务已通过" not in sent_texts(notices)[0]
+    assert "待提交" in sent_texts(notices)[0]
+    assert "已通过" not in sent_texts(notices)[0]
     assert notice_rows(notices)[0].phase == "waiting"
 
 
@@ -386,13 +417,13 @@ def test_dms_pending_and_completed_cards_report_status_without_approving(notices
     assert len(notices.feishu.sent) == 2
     assert sent_phases(notices) == ["received", "needs_human"]
     assert "123456" in sent_texts(notices)[0]
-    assert "不自动审批" in sent_texts(notices)[-1]
+    assert "待你审批" in sent_texts(notices)[-1]
     notices.clock.now += timedelta(seconds=1)
     complete_dms_card(notices, identifier)
     notices.service.tick()
     assert len(notices.feishu.sent) == 3
     assert sent_phases(notices) == ["received", "needs_human", "responded"]
-    assert "已同意" in sent_texts(notices)[-1]
+    assert "已通过" in sent_texts(notices)[-1]
     notices.service.tick()
     assert len(notices.feishu.sent) == 3
 
@@ -403,8 +434,7 @@ def test_pending_dms_message_is_reported_before_attention_then_shared_state_dedu
     notices.service.tick()
     assert len(notices.feishu.sent) == 2
     assert sent_phases(notices) == ["received", "needs_human"]
-    assert "123456" in sent_texts(notices)[0] and "仍待你审批" in sent_texts(notices)[-1]
-    assert "不自动审批" in sent_texts(notices)[-1]
+    assert "123456" in sent_texts(notices)[0] and "待你审批" in sent_texts(notices)[-1]
     with notices.sessions.begin() as db:
         assert db.get(MessageAttention, identifier) is None
         message = db.get(Message, "om_dms")
@@ -436,7 +466,7 @@ def test_unknown_dms_buttons_still_get_receipt_before_unverified_status(notices)
     identifier = add_dms_attention(notices, with_attention=False, buttons=("查看详情",))
     notices.service.tick()
     assert sent_phases(notices) == ["received", "error"]
-    assert all("仍待你审批" not in text for text in sent_texts(notices))
+    assert all("待你审批" not in text for text in sent_texts(notices))
     with notices.sessions() as db:
         assert db.get(MessageAttention, identifier) is None
 
@@ -463,7 +493,7 @@ def test_dms_receipt_survives_permission_wait_and_precedes_latest_completed_stat
     notices.service.tick()
     assert sent_phases(notices) == ["received", "responded"]
     assert notices.feishu.sent[0][1] == receipt.id
-    assert "已同意" in sent_texts(notices)[-1]
+    assert "已通过" in sent_texts(notices)[-1]
     notices.service.tick()
     assert len(notices.feishu.sent) == 2
 
@@ -495,7 +525,7 @@ def test_new_dms_conclusion_cannot_bypass_receipt_permission_retry_delay(notices
     assert notices.feishu.sent[0][1] == receipt.id
 
 
-def test_unknown_dms_receipt_allows_conclusion_without_resending_receipt_on_restart(notices):
+def test_unknown_dms_card_creation_blocks_conclusion_without_duplicate_on_restart(notices):
     activate(notices)
     identifier = add_dms_attention(notices, with_attention=False)
     revision = dms_receipt_revision(identifier)
@@ -512,14 +542,14 @@ def test_unknown_dms_receipt_allows_conclusion_without_resending_receipt_on_rest
     conclusion = next(row for row in rows if row.phase == "needs_human")
     assert receipt.status == "unknown" and receipt.submitted_at is not None
     assert receipt.sent_at is None
-    assert conclusion.status == "sent" and conclusion.sent_at is not None
-    assert sent_phases(notices) == ["received", "needs_human"]
+    assert conclusion.status == "blocked_unknown" and conclusion.sent_at is None
+    assert sent_phases(notices) == ["received"]
 
     notices.clock.now += timedelta(hours=1)
     notices.service = StatusNotificationService(notices.settings, notices.sessions, notices.feishu)
     for _ in range(3):
         notices.service.tick()
-    assert len(notices.feishu.sent) == 2
+    assert len(notices.feishu.sent) == 1
     assert sum(notice_id == receipt.id for _, notice_id, _ in notices.feishu.sent) == 1
     assert next(row for row in notice_rows(notices) if row.id == receipt.id).status == "unknown"
 
@@ -548,7 +578,7 @@ def test_new_completed_dms_card_without_attention_gets_receipt_then_actual_compl
     notices.service.tick()
     assert sent_phases(notices) == ["received", "responded"]
     assert "123456" in sent_texts(notices)[0]
-    assert "已同意" in sent_texts(notices)[-1]
+    assert "已通过" in sent_texts(notices)[-1]
     with notices.sessions() as db:
         assert db.get(MessageAttention, identifier) is None
     notices.service = StatusNotificationService(notices.settings, notices.sessions, notices.feishu)
@@ -563,7 +593,7 @@ def test_cached_completed_dms_card_never_reports_stale_pending_attention(notices
     complete_dms_card(notices, identifier, update_attention=False)
     notices.service.tick()
     assert sent_phases(notices) == ["received", "responded"]
-    assert all("仍待你审批" not in text for text in sent_texts(notices))
+    assert all("待你审批" not in text for text in sent_texts(notices))
     with notices.sessions() as db:
         # Notification projection is read-only; the attention worker owns its state.
         assert db.get(MessageAttention, identifier).status == "waiting"
@@ -578,8 +608,8 @@ def test_baselined_old_dms_card_reports_later_completion_without_replaying_pendi
     notices.service.tick()
     assert len(notices.feishu.sent) == 1
     assert sent_phases(notices) == ["responded"]
-    assert "已同意" in sent_texts(notices)[0]
-    assert "仍待你审批" not in sent_texts(notices)[0]
+    assert "已通过" in sent_texts(notices)[0]
+    assert "待你审批" not in sent_texts(notices)[0]
     notices.service.tick()
     assert len(notices.feishu.sent) == 1
 
@@ -596,7 +626,7 @@ def test_latest_judgment_supersedes_unsent_received_notice(notices):
     notices.feishu.ready = True
     notices.service.tick()
     assert len(notices.feishu.sent) == 1
-    assert "需要立即处理服务故障。" in sent_texts(notices)[0]
+    assert "重要消息，待你响应" in sent_texts(notices)[0]
     rows = notice_rows(notices)
     assert len([row for row in rows if row.status == "superseded"]) == 1
     assert len([row for row in rows if row.status == "sent"]) == 1

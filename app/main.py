@@ -271,7 +271,8 @@ def create_app(settings=None, *, transport=None):
                     "enabled": settings.status_notifications_enabled,
                     "sent": count(StatusNotification, StatusNotification.status == "sent", StatusNotification.owner_open_id == (account.open_id if account else "")),
                     "pending": count(StatusNotification, StatusNotification.status.in_(["queued", "blocked_permission"]), StatusNotification.owner_open_id == (account.open_id if account else "")),
-                    "unknown": count(StatusNotification, StatusNotification.status == "unknown", StatusNotification.owner_open_id == (account.open_id if account else "")),
+                    "unknown": count(StatusNotification, StatusNotification.status.in_(["unknown", "blocked_unknown"]), StatusNotification.owner_open_id == (account.open_id if account else "")),
+                    "failed": count(StatusNotification, StatusNotification.status == "failed", StatusNotification.owner_open_id == (account.open_id if account else "")),
                 },
                 "approval_automation": {
                     "enabled": settings.approval_automation_enabled,

@@ -122,7 +122,7 @@ async function refreshStatus() {
   const notices = s.status_notifications;
   $("status-notification-policy").textContent = !notices?.enabled
     ? "即时状态私信未启用。"
-    : `收到新审批、DMS 待办或明确 @ 本人的消息后，机器人直接私信汇报状态与判断，后续重要变化再更新。已发送 ${notices.sent} 条，待发送 ${notices.pending} 条，结果未确认 ${notices.unknown} 条。首次启用不补发历史消息，状态私信不会取消原有 15 分钟电话提醒。`;
+    : `每件审批、DMS 待办和 @ 消息只发一张简洁卡片，后续状态在原卡片上更新。状态投递成功 ${notices.sent} 次，待处理 ${notices.pending} 次，结果未确认 ${notices.unknown} 次，失败 ${notices.failed ?? 0} 次。旧通知保留，15 分钟电话提醒规则不变。`;
   updateSyncLabels();
 }
 function renderAttentionStatus() {
