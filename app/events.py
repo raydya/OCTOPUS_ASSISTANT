@@ -14,6 +14,8 @@ from app.models import (
     Chat,
     EventInbox,
     Message,
+    StatusNoticeSource,
+    StatusNotification,
     SyncJob,
     WorkerState,
     utcnow,
@@ -119,7 +121,7 @@ class BackgroundSync:
         return bool(self.settings.dms_sender_app_id and self.settings.dms_chat_id)
 
     def reminder_instance_codes(self):
-        """Only current user tasks and genuinely unconfirmed submissions need reads."""
+        """Read active tasks, uncertain submissions, and notified tasks awaiting closure."""
         owner = select(Account.open_id).where(Account.id == 1).scalar_subquery()
         pending = select(ApprovalTask.instance_code).where(
             ApprovalTask.topic == "1", ApprovalTask.visible, ApprovalTask.status == "1",
@@ -135,7 +137,34 @@ class BackgroundSync:
                 ApprovalTask.instance_code == ApprovalReview.instance_code,
             ).exists(),
         )
-        return pending.union(submitted)
+        # Leaving the pending list is not a completion result. Finish reading
+        # only the user's already-delivered cards while they remain updatable;
+        # this never scans the historical approval lists or legacy text notices.
+        recent_card = select(StatusNotification.id).where(
+            StatusNotification.source_key == StatusNoticeSource.key,
+            StatusNotification.owner_open_id == owner,
+            StatusNotification.message_id == StatusNoticeSource.card_message_id,
+            StatusNotification.delivery_action == "create",
+            StatusNotification.status == "sent",
+            StatusNotification.sent_at > utcnow() - timedelta(days=14),
+            StatusNotification.sent_at <= utcnow(),
+        ).exists()
+        completion = select(ApprovalTask.instance_code).join(
+            StatusNoticeSource, StatusNoticeSource.source_id == ApprovalTask.task_id,
+        ).where(
+            ApprovalTask.topic == "1",
+            or_(ApprovalTask.visible.is_(False), ApprovalTask.status != "1"),
+            ApprovalTask.raw["user_id"].as_string() == owner,
+            ApprovalTask.raw["task_id"].as_string() == ApprovalTask.task_id,
+            ApprovalTask.raw["instance_code"].as_string() == ApprovalTask.instance_code,
+            StatusNoticeSource.owner_open_id == owner,
+            StatusNoticeSource.source_type == "approval",
+            StatusNoticeSource.card_create_state == "ready",
+            StatusNoticeSource.card_message_id.is_not(None),
+            StatusNoticeSource.payload["phase"].as_string() == "responded",
+            recent_card,
+        )
+        return pending.union(submitted, completion)
 
     def reminder_job_filter(self):
         instances = self.reminder_instance_codes().subquery()

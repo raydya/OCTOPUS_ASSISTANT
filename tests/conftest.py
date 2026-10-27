@@ -80,6 +80,11 @@ def make_app(settings, database):
     yield factory
     for app in apps:
         app.state.feishu.close()
+        # Worker/service tests use the factory without a TestClient lifespan;
+        # release their application pools as well as the fixture's DDL engine.
+        with app.state.sessions() as db:
+            app_engine = db.get_bind()
+        app_engine.dispose()
 
 
 def token_response(access="user-access", refresh="user-refresh"):

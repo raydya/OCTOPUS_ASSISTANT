@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from sqlalchemy import func, or_, select, text, tuple_, update
 
+from app.approval_completion import completed_owner_task_status
 from app.attention import is_personal_mention, source_hash
 from app.dms_attention import (
     TERMINAL,
@@ -111,10 +112,35 @@ class StatusNotificationService:
         ).order_by(ModelAssessment.created_at.desc(), ModelAssessment.id.desc()).limit(1))
         detail = db.get(ApprovalInstance, task.instance_code, populate_existing=True)
         snapshot = business_snapshot(raw, detail.raw, owner) if detail else ""
-        return approval_notice(
+        # A task may return to pending after rollback. Older instance data
+        # cannot establish the outcome of the newer task-list observation.
+        completion_detail = detail.raw if detail and detail.synced_at >= task.synced_at else None
+        payload = approval_notice(
             task, review, assessment, base_url=self.settings.app_base_url,
-            current_snapshot_hash=snapshot,
+            current_snapshot_hash=snapshot, instance_detail=completion_detail,
         )
+        if completed_owner_task_status(
+            completion_detail, instance_code=task.instance_code, task_id=task.task_id,
+            owner_open_id=owner,
+        ):
+            source = db.get(StatusNoticeSource, source_key(owner, "approval", task.task_id))
+            if (
+                source and source.card_create_state != "ready"
+                and source.revision != payload["revision"]
+                and (
+                    detail.synced_at <= source.updated_at
+                    or detail.synced_at + timedelta(seconds=self.settings.attention_timeout_seconds) <= utcnow()
+                )
+            ):
+                # A newly supported display mapping must not re-announce old
+                # legacy text history. Only recent new reads are evidence; after
+                # _observe records it, matching revisions preserve that same
+                # evidence during _deliver's second projection.
+                return approval_notice(
+                    task, review, assessment, base_url=self.settings.app_base_url,
+                    current_snapshot_hash=snapshot,
+                )
+        return payload
 
     def _mention(self, db, message, chat, owner):
         if (

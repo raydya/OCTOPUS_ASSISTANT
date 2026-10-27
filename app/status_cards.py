@@ -110,6 +110,7 @@ def _facts(payload):
     statuses = {
         "received": "⏳ 正在核验", "assessing": "⏳ 正在核验",
         "needs_human": "🔔 待你处理", "approved": "✅ 已通过",
+        "rejected": "❌ 已拒绝", "transferred": "↪️ 已转交", "completed": "ℹ️ 本人节点已结束",
         "submitting": "⏳ 正在提交，结果未确认", "submission_unknown": "⚠️ 提交结果未确认",
         "responded": "ℹ️ 已停止提醒", "acknowledged": "⏸ 已停止提醒",
         "held": "⏸ 已暂缓", "error": "⚠️ 核验受阻",

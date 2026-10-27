@@ -11,6 +11,7 @@ import json
 import re
 from urllib.parse import urlencode, urlsplit
 
+from app.approval_completion import completed_owner_task_status
 from app.status_cards import (
     approval_button,
     attach_card,
@@ -197,6 +198,7 @@ def _current_model(task, review, assessment, current_snapshot_hash):
 
 def approval_notice(
     task, review=None, assessment=None, *, base_url="", current_snapshot_hash=None,
+    instance_detail=None,
 ):
     """Return the current task status, never treating an approve proposal as done.
 
@@ -215,15 +217,30 @@ def approval_notice(
     reasons = _get(review, "reasons", [])
     cached_model = _mapping(_get(review, "model_review"))
     model = _current_model(task, review, assessment, current_snapshot_hash)
+    completed = completed_owner_task_status(
+        instance_detail, instance_code=_get(task, "instance_code"), task_id=task_id,
+        owner_open_id=_mapping(_get(task, "raw")).get("user_id"),
+    )
     phase, terminal = "received", False
     status, next_step = "已收到，等待判断。", "后台将核验最新内容，再告知判断和处理结果。"
     show_judgment = False
 
-    if execution == "approved" and _get(review, "confirmed_at"):
+    if execution == "approved" and _get(review, "confirmed_at") and completed in {None, "APPROVED"}:
         phase, terminal = "approved", True
         status = "你的审批任务已通过，已回读飞书确认。"
         next_step = "本任务无需再审批；整个审批流程是否完成以飞书为准。"
         show_judgment = bool(model)
+    elif completed:
+        # A person may finish the task directly in Feishu. Project that
+        # verified result without inventing an application submission record.
+        phase, status = {
+            "APPROVED": ("approved", "你的审批任务已通过，已回读飞书确认。"),
+            "REJECTED": ("rejected", "你的审批任务已拒绝，已回读飞书确认。"),
+            "TRANSFERRED": ("transferred", "你的审批任务已转交，已回读飞书确认。"),
+            "DONE": ("completed", "你的审批节点已结束，未据此认定为同意通过。"),
+        }[completed]
+        terminal = True
+        next_step = "本任务无需再审批；整个审批流程是否完成以飞书为准。"
     elif execution in {"submitting", "unknown", "approved"} or _get(review, "submitted_at"):
         phase = "submitting" if execution == "submitting" else "submission_unknown"
         status = (
@@ -297,6 +314,7 @@ def approval_notice(
         "waiting": "⏳ 待提交审批", "needs_human": "🔔 待你处理",
         "submitting": "⏳ 正在提交，结果未确认", "submission_unknown": "⚠️ 提交结果未确认",
         "approved": "✅ 已通过", "responded": "ℹ️ 已不在当前待办",
+        "rejected": "❌ 已拒绝", "transferred": "↪️ 已转交", "completed": "ℹ️ 本人节点已结束",
         "held": "⏸ 已暂缓", "error": "⚠️ 核验或执行受阻",
     }[phase]
     if phase == "error" and execution == "blocked_permission":
