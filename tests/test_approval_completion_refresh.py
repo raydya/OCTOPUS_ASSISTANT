@@ -9,7 +9,7 @@ from test_reminder_only_sync import queue_resources, task
 from test_reminder_only_sync import reminder as reminder
 
 from app.events import BackgroundSync, enqueue
-from app.models import StatusNoticeSource, StatusNotification, SyncJob, utcnow
+from app.models import ApprovalTask, StatusNoticeSource, StatusNotification, SyncJob, utcnow
 
 pytestmark = pytest.mark.integration
 
@@ -54,7 +54,7 @@ def test_recent_notified_task_gets_final_instance_read_after_leaving_pending(rem
     assert not queue_resources(reminder)
 
 
-@pytest.mark.parametrize("phase", ["approved", "rejected", "transferred", "completed"])
+@pytest.mark.parametrize("phase", ["approved", "rejected", "transferred", "completed", "processed"])
 def test_confirmed_completion_stops_targeted_refresh(reminder, phase):
     identifier, _ = tracked_card(reminder)
     reminder.worker.schedule_snapshot()
@@ -126,3 +126,58 @@ def test_final_refresh_does_not_require_any_new_history_or_approval_submission(r
         from app.models import ApprovalReview
 
         assert not list(db.scalars(select(ApprovalReview)))
+
+
+@pytest.mark.parametrize("markers", [
+    {"instance_external_id": "people_instance", "task_external_id": "people_task"},
+    {"instance_external_id": "people_instance"},
+    {"task_external_id": "people_task"},
+])
+def test_active_external_approval_does_not_trigger_native_or_handled_detail_poll(reminder, markers):
+    with reminder.sessions.begin() as db:
+        row = task("external", "external")
+        row.raw = {**row.raw, **markers}
+        db.add(row)
+        enqueue(db, "instance:external")
+    reminder.worker.schedule_snapshot()
+    assert queue_resources(reminder) == {"approvals:1", "dms_cards"}
+    with reminder.sessions() as db:
+        assert list(db.scalars(reminder.worker.reminder_instance_codes())) == []
+
+
+@pytest.mark.parametrize("markers", [
+    {}, {"instance_external_id": None, "task_external_id": None},
+    {"instance_external_id": "", "task_external_id": ""},
+    {"instance_external_id": None, "task_external_id": ""},
+])
+def test_native_pending_approval_keeps_detail_refresh_when_external_ids_are_empty(reminder, markers):
+    with reminder.sessions.begin() as db:
+        row = task("native", "native")
+        row.raw = {**row.raw, **markers}
+        db.add(row)
+    reminder.worker.schedule_snapshot()
+    assert queue_resources(reminder) == {"approvals:1", "dms_cards", "instance:native"}
+
+
+def test_external_completion_is_only_polled_for_an_existing_delivered_card(reminder):
+    identifier, _ = tracked_card(reminder, identifier="external_finished")
+    with reminder.sessions.begin() as db:
+        tracked = db.get(ApprovalTask, (identifier, "1"))
+        tracked.raw = {
+            **tracked.raw, "instance_external_id": "people_tracked", "task_external_id": "task_tracked",
+        }
+        untracked = task("external_untracked", "external_untracked", visible=False)
+        untracked.raw = {
+            **untracked.raw, "instance_external_id": "people_untracked", "task_external_id": "task_untracked",
+        }
+        db.add(untracked)
+        enqueue(db, "instance:external_untracked")
+        enqueue(db, "approvals:2")
+    reminder.worker.schedule_snapshot()
+    assert queue_resources(reminder) == {"approvals:1", "dms_cards", f"instance:{identifier}"}
+
+    # A rollback/reopened pending observation must stop completion polling too.
+    with reminder.sessions.begin() as db:
+        db.get(ApprovalTask, (identifier, "1")).visible = True
+    reminder.worker.cancel_disallowed_jobs()
+    assert queue_resources(reminder) == {"approvals:1", "dms_cards"}

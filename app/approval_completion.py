@@ -13,6 +13,7 @@ def completed_owner_task_status(detail, *, instance_code, task_id, owner_open_id
     if (
         not all(isinstance(value, str) and value for value in (instance_code, task_id, owner_open_id))
         or not isinstance(detail, dict) or detail.get("instance_code") != instance_code
+        or detail.get("_source")
         or not isinstance(detail.get("tasks"), list)
     ):
         return None

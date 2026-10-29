@@ -25,6 +25,7 @@ from app.dms_attention import (
 )
 from app.errors import AppError
 from app.external_approval import SOURCE as EXTERNAL_COMPLETION_SOURCE
+from app.external_approval import personal_handled_result
 from app.model_review import business_snapshot
 from app.models import (
     Account,
@@ -120,8 +121,8 @@ class StatusNotificationService:
             completion_detail and completion_detail.get("_source") == EXTERNAL_COMPLETION_SOURCE
             and task.visible and task.status == "1"
         ):
-            # External task search is eventually consistent. A positive live
-            # pending observation outranks even a later fetch of its old index.
+            # A positive current pending observation outranks a handled-list
+            # result, including when the same task is returned for reapproval.
             completion_detail = None
         payload = approval_notice(
             task, review, assessment, base_url=self.settings.app_base_url,
@@ -130,7 +131,7 @@ class StatusNotificationService:
         if completed_owner_task_status(
             completion_detail, instance_code=task.instance_code, task_id=task.task_id,
             owner_open_id=owner,
-        ):
+        ) or personal_handled_result(completion_detail, raw, not_before=task.synced_at) is not None:
             source = db.get(StatusNoticeSource, source_key(owner, "approval", task.task_id))
             if (
                 source and source.card_create_state != "ready"

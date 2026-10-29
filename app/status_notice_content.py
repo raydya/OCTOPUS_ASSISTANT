@@ -12,6 +12,7 @@ import re
 from urllib.parse import urlencode, urlsplit
 
 from app.approval_completion import completed_owner_task_status
+from app.external_approval import personal_handled_result
 from app.status_cards import (
     approval_button,
     attach_card,
@@ -221,11 +222,24 @@ def approval_notice(
         instance_detail, instance_code=_get(task, "instance_code"), task_id=task_id,
         owner_open_id=_mapping(_get(task, "raw")).get("user_id"),
     )
+    handled = personal_handled_result(
+        instance_detail, _mapping(_get(task, "raw")), not_before=_get(task, "synced_at"),
+    ) if (
+        _get(task, "visible") is False or str(_get(task, "status", "1")) != "1"
+    ) else None
+    handled_display = {
+        "0": "✅ 已处理", "1": "✅ 已处理", "2": "✅ 已处理 · 流程已通过",
+        "3": "ℹ️ 已处理 · 流程已拒绝", "4": "ℹ️ 已处理 · 流程已撤销", "5": "ℹ️ 已处理 · 流程已终止",
+    }.get(handled)
     phase, terminal = "received", False
     status, next_step = "已收到，等待判断。", "后台将核验最新内容，再告知判断和处理结果。"
     show_judgment = False
 
-    if execution == "approved" and _get(review, "confirmed_at") and completed in {None, "APPROVED"}:
+    if handled_display:
+        phase, terminal = "processed", True
+        status = handled_display + "，已从你的个人已办记录确认。"
+        next_step = "本任务无需再处理；流程结果与本人具体审批动作分别记录。"
+    elif execution == "approved" and _get(review, "confirmed_at") and completed in {None, "APPROVED"}:
         phase, terminal = "approved", True
         status = "你的审批任务已通过，已回读飞书确认。"
         next_step = "本任务无需再审批；整个审批流程是否完成以飞书为准。"
@@ -315,6 +329,7 @@ def approval_notice(
         "submitting": "⏳ 正在提交，结果未确认", "submission_unknown": "⚠️ 提交结果未确认",
         "approved": "✅ 已通过", "responded": "ℹ️ 已不在当前待办",
         "rejected": "❌ 已拒绝", "transferred": "↪️ 已转交", "completed": "ℹ️ 本人节点已结束",
+        "processed": handled_display,
         "held": "⏸ 已暂缓", "error": "⚠️ 核验或执行受阻",
     }[phase]
     if phase == "error" and execution == "blocked_permission":

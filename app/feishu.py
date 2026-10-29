@@ -673,17 +673,27 @@ class FeishuClient:
             {"instance_code": instance_code, "locale": "zh-CN", "user_id_type": "open_id"},
         )
 
-    def external_approval_tasks(
-        self, instance_code: str, *, expected_owner: str, page_token: str | None = None,
+    def personal_handled_approval_tasks(
+        self, definition_code: str, *, expected_owner: str, start_timestamp: str,
+        end_timestamp: str, page_token: str | None = None,
     ) -> dict:
-        """Read tasks for one known external instance and the bound owner only."""
+        """Read a bounded personal handled list using existing user permission.
+
+        The endpoint exposes handled state and workflow outcome, not the
+        individual's approve/reject operation. Callers must match known task
+        identities and must not treat the workflow outcome as that operation.
+        """
         if (
-            not isinstance(instance_code, str) or not instance_code.strip()
-            or instance_code != instance_code.strip() or len(instance_code) > 128
+            not isinstance(definition_code, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", definition_code)
             or not isinstance(expected_owner, str)
             or not re.fullmatch(r"ou_[A-Za-z0-9_-]{1,128}", expected_owner)
+            or not all(isinstance(value, str) and re.fullmatch(r"[0-9]{1,12}", value)
+                       for value in (start_timestamp, end_timestamp))
         ):
-            raise AppError("invalid_approval_search", "审批查询需要明确的实例及本人身份。", 422)
+            raise AppError("invalid_approval_lookup", "审批核验需要明确的定义、本人身份及时间范围。", 422)
+        if not 0 < int(start_timestamp) < int(end_timestamp) <= int(start_timestamp) + 14 * 86400:
+            raise AppError("invalid_approval_window", "审批核验时间范围应在 14 天以内。", 422)
         if page_token is not None and (not isinstance(page_token, str) or not page_token):
             raise AppError("invalid_page_token", "审批查询分页标识无效。", 422)
 
@@ -694,30 +704,28 @@ class FeishuClient:
                     raise AppError("approval_owner_changed", "审批查询绑定的账号发生变化。", 409)
 
         verify_owner()
-        token = self.app_token()
-        verify_owner()
-        # This POST is a read-only search. Never broaden it to a tenant-wide
-        # history query, and retain the provider's exact task/owner bindings.
-        body = self._request(
-            "POST", "/approval/v4/tasks/search",
-            headers={"Authorization": f"Bearer {token}"},
-            params={
+        # Only the personal endpoint is allowed here. Definition and time
+        # constraints stay mandatory on every page; no tenant-wide fallback.
+        data = self._get(
+            "/approval/v4/tasks",
+            {
+                "topic": "2", "definition_code": definition_code, "locale": "zh-CN",
                 "user_id_type": "open_id", "page_size": 100,
+                "start_timestamp": start_timestamp, "end_timestamp": end_timestamp,
                 **({"page_token": page_token} if page_token else {}),
             },
-            json={"user_id": expected_owner, "instance_code": instance_code, "locale": "zh-CN"},
         )
         verify_owner()
-        data = body.get("data")
         if (
-            not isinstance(data, dict) or not isinstance(data.get("task_list"), list)
+            not isinstance(data, dict) or not isinstance(data.get("tasks"), list)
+            or any(not isinstance(task, dict) for task in data["tasks"])
             or type(data.get("has_more")) is not bool
             or data["has_more"] and (
                 not isinstance(data.get("page_token"), str) or not data["page_token"]
                 or data["page_token"] == page_token
             )
         ):
-            raise FeishuError("invalid_external_approval_tasks")
+            raise FeishuError("invalid_personal_approval_tasks")
         return data
 
     def approve_task(self, instance_code: str, task_id: str, comment: str):

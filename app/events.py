@@ -3,7 +3,7 @@
 import json
 from datetime import timedelta
 
-from sqlalchemy import case, delete, literal, or_, select
+from sqlalchemy import case, delete, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import insert
 
 from app.errors import AppError
@@ -126,6 +126,11 @@ class BackgroundSync:
         pending = select(ApprovalTask.instance_code).where(
             ApprovalTask.topic == "1", ApprovalTask.visible, ApprovalTask.status == "1",
             ApprovalTask.raw["user_id"].as_string() == owner,
+            # External workflows have no native detail endpoint. Their personal
+            # handled-result lookup is needed only after a notified task leaves
+            # pending, through the narrowly scoped completion branch below.
+            func.coalesce(ApprovalTask.raw["instance_external_id"].as_string(), "") == "",
+            func.coalesce(ApprovalTask.raw["task_external_id"].as_string(), "") == "",
         )
         submitted = select(ApprovalReview.instance_code).where(
             ApprovalReview.owner_open_id == owner,

@@ -2,7 +2,7 @@ import re
 import time
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from sqlalchemy import or_, select, text, update
@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from app.content import message_text, parse_json
 from app.errors import AppError, FeishuError
+from app.external_approval import SOURCE as PERSONAL_APPROVAL_SOURCE
 from app.external_approval import completion_detail, external_bindings
 from app.models import (
     Account,
@@ -17,6 +18,8 @@ from app.models import (
     ApprovalTask,
     Chat,
     Message,
+    StatusNoticeSource,
+    StatusNotification,
     SyncRun,
     SyncState,
     utcnow,
@@ -132,9 +135,17 @@ class SyncService:
                     raise AppError("instance_not_found", "请先同步对应审批任务。", 404)
                 instance = db.get(ApprovalInstance, identifier)
                 bindings = self._external_bindings(db, identifier, owner[0])
+                parameters = {}
+                if bindings:
+                    end = int(started.timestamp())
+                    parameters = {
+                        "external_tasks": bindings,
+                        "external_target_ids": self._external_completion_targets(db, identifier, owner[0]),
+                        "start_timestamp": str(end - 14 * 86400), "end_timestamp": str(end),
+                    }
                 return ReadPlan(
                     resource, kind, identifier, chat_id, owner, None, "",
-                    {"external_tasks": bindings} if bindings else {}, None,
+                    parameters, None,
                     started, instance.synced_at if instance else None,
                 )
             state = db.get(SyncState, resource)
@@ -166,7 +177,8 @@ class SyncService:
         """Fetch a bounded batch with no application DB transaction or write lock."""
         if plan.kind == "instance":
             if plan.parameters.get("external_tasks"):
-                return [self._read_external_completion(plan)], False, None
+                detail = self._read_external_completion(plan)
+                return [detail] if detail is not None else [], False, None
             return [self.feishu.instance(plan.identifier)], False, None
         cursor, has_more, rows = plan.page_token, True, []
         seen_tokens = {cursor}
@@ -201,26 +213,58 @@ class SyncService:
         return external_bindings(tasks, identifier, owner)
 
     def _read_external_completion(self, plan):
+        targets = set(plan.parameters["external_target_ids"])
+        bindings = [item for item in plan.parameters["external_tasks"] if item["task_id"] in targets]
+        if not bindings:
+            return None
+        definitions = {item["definition_code"] for item in bindings}
+        if len(definitions) != 1:
+            raise FeishuError("invalid_external_approval")
+        definition = definitions.pop()
         cursor, seen, items = None, {None}, []
         for _ in range(self.settings.sync_page_limit):
-            data = self.feishu.external_approval_tasks(
-                plan.identifier, expected_owner=plan.owner[0], page_token=cursor,
+            data = self.feishu.personal_handled_approval_tasks(
+                definition, expected_owner=plan.owner[0], page_token=cursor,
+                start_timestamp=plan.parameters["start_timestamp"],
+                end_timestamp=plan.parameters["end_timestamp"],
             )
             if (
-                not isinstance(data, dict) or not isinstance(data.get("task_list"), list)
-                or any(not isinstance(item, dict) for item in data["task_list"])
+                not isinstance(data, dict) or not isinstance(data.get("tasks"), list)
+                or any(not isinstance(item, dict) for item in data["tasks"])
                 or type(data.get("has_more")) is not bool
             ):
                 raise FeishuError("invalid_response")
-            items.extend(data["task_list"])
+            items.extend(item for item in data["tasks"] if item.get("task_id") in targets)
             if not data["has_more"]:
-                return completion_detail(items, plan.parameters["external_tasks"], plan.identifier)
+                return completion_detail(items, bindings, plan.identifier, observed_at=plan.started)
             cursor = data.get("page_token")
             if not isinstance(cursor, str) or not cursor or cursor in seen:
                 raise FeishuError("invalid_pagination")
             seen.add(cursor)
         # A partial page cannot rule out conflicting duplicate task identities.
         raise FeishuError("external_approval_incomplete")
+
+    @staticmethod
+    def _external_completion_targets(db, instance_code, owner):
+        """Only finish recent, delivered reminders which have left pending."""
+        recent_card = select(StatusNotification.id).where(
+            StatusNotification.source_key == StatusNoticeSource.key,
+            StatusNotification.owner_open_id == owner,
+            StatusNotification.message_id == StatusNoticeSource.card_message_id,
+            StatusNotification.delivery_action == "create", StatusNotification.status == "sent",
+            StatusNotification.sent_at > utcnow() - timedelta(days=14),
+            StatusNotification.sent_at <= utcnow(),
+        ).exists()
+        return list(db.scalars(select(ApprovalTask.task_id).join(
+            StatusNoticeSource, StatusNoticeSource.source_id == ApprovalTask.task_id,
+        ).where(
+            ApprovalTask.instance_code == instance_code, ApprovalTask.topic == "1",
+            or_(ApprovalTask.visible.is_(False), ApprovalTask.status != "1"),
+            ApprovalTask.raw["user_id"].as_string() == owner,
+            StatusNoticeSource.owner_open_id == owner, StatusNoticeSource.source_type == "approval",
+            StatusNoticeSource.card_create_state == "ready", StatusNoticeSource.card_message_id.is_not(None),
+            StatusNoticeSource.payload["phase"].as_string() == "responded", recent_card,
+        ).order_by(ApprovalTask.task_id)))
 
     def _commit(self, plan, rows, has_more, cursor):
         with self.sessions.begin() as db:
@@ -234,11 +278,26 @@ class SyncService:
                 if plan.parameters.get("external_tasks") and (
                     self._external_bindings(db, plan.identifier, plan.owner[0])
                     != plan.parameters["external_tasks"]
+                    or self._external_completion_targets(db, plan.identifier, plan.owner[0])
+                    != plan.parameters["external_target_ids"]
                 ):
                     raise AppError("sync_cursor_changed", "审批任务已更新，请稍后重试。", 409)
-                upsert(db, ApprovalInstance, {
-                    "instance_code": plan.identifier, "raw": rows[0], "synced_at": utcnow(),
-                })
+                if rows:
+                    raw = rows[0]
+                    if (
+                        plan.parameters.get("external_tasks") and cached
+                        and cached.raw.get("_source") == PERSONAL_APPROVAL_SOURCE
+                    ):
+                        # Preserve other tasks' evidence and its original read
+                        # time. Refreshing B cannot erase or re-date A's result.
+                        targets = set(plan.parameters["external_target_ids"])
+                        retained = [item for item in cached.raw.get("handled_tasks", [])
+                                    if isinstance(item, dict) and item.get("user_id") == plan.owner[0]
+                                    and item.get("task_id") not in targets]
+                        raw = {**raw, "handled_tasks": [*retained, *raw["handled_tasks"]]}
+                    upsert(db, ApprovalInstance, {
+                        "instance_code": plan.identifier, "raw": raw, "synced_at": utcnow(),
+                    })
             else:
                 state = db.get(SyncState, plan.resource)
                 if _state_version(state) != plan.previous:
