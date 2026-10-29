@@ -24,6 +24,7 @@ from app.dms_attention import (
     dms_attention_id,
 )
 from app.errors import AppError
+from app.external_approval import SOURCE as EXTERNAL_COMPLETION_SOURCE
 from app.model_review import business_snapshot
 from app.models import (
     Account,
@@ -115,6 +116,13 @@ class StatusNotificationService:
         # A task may return to pending after rollback. Older instance data
         # cannot establish the outcome of the newer task-list observation.
         completion_detail = detail.raw if detail and detail.synced_at >= task.synced_at else None
+        if (
+            completion_detail and completion_detail.get("_source") == EXTERNAL_COMPLETION_SOURCE
+            and task.visible and task.status == "1"
+        ):
+            # External task search is eventually consistent. A positive live
+            # pending observation outranks even a later fetch of its old index.
+            completion_detail = None
         payload = approval_notice(
             task, review, assessment, base_url=self.settings.app_base_url,
             current_snapshot_hash=snapshot, instance_detail=completion_detail,

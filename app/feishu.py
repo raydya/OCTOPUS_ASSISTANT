@@ -102,7 +102,12 @@ class FeishuClient:
                 self.sleep(max(0, min(delay, 5)))
                 continue
             if response.is_error or response.is_redirect or code != "0" or body.get("error"):
-                error = str(body.get("error") or (code if code != "0" else response.status_code))
+                # Structured diagnostics must not hide the error code. Keep
+                # OAuth's named errors so device authorization can still poll.
+                named_error = body.get("error")
+                error = named_error if isinstance(named_error, str) and re.fullmatch(
+                    r"[A-Za-z0-9_]{1,40}", named_error,
+                ) else str(code if code != "0" else response.status_code)
                 # Keep error identifiers bounded and prevent provider text from leaking.
                 error = error if re.fullmatch(r"[A-Za-z0-9_]{1,40}", error) else "upstream"
                 raise FeishuError(error)
@@ -667,6 +672,53 @@ class FeishuClient:
             "/approval/v4/instances/detail",
             {"instance_code": instance_code, "locale": "zh-CN", "user_id_type": "open_id"},
         )
+
+    def external_approval_tasks(
+        self, instance_code: str, *, expected_owner: str, page_token: str | None = None,
+    ) -> dict:
+        """Read tasks for one known external instance and the bound owner only."""
+        if (
+            not isinstance(instance_code, str) or not instance_code.strip()
+            or instance_code != instance_code.strip() or len(instance_code) > 128
+            or not isinstance(expected_owner, str)
+            or not re.fullmatch(r"ou_[A-Za-z0-9_-]{1,128}", expected_owner)
+        ):
+            raise AppError("invalid_approval_search", "审批查询需要明确的实例及本人身份。", 422)
+        if page_token is not None and (not isinstance(page_token, str) or not page_token):
+            raise AppError("invalid_page_token", "审批查询分页标识无效。", 422)
+
+        def verify_owner():
+            with self.sessions() as db:
+                account = db.get(Account, 1)
+                if not account or account.open_id != expected_owner:
+                    raise AppError("approval_owner_changed", "审批查询绑定的账号发生变化。", 409)
+
+        verify_owner()
+        token = self.app_token()
+        verify_owner()
+        # This POST is a read-only search. Never broaden it to a tenant-wide
+        # history query, and retain the provider's exact task/owner bindings.
+        body = self._request(
+            "POST", "/approval/v4/tasks/search",
+            headers={"Authorization": f"Bearer {token}"},
+            params={
+                "user_id_type": "open_id", "page_size": 100,
+                **({"page_token": page_token} if page_token else {}),
+            },
+            json={"user_id": expected_owner, "instance_code": instance_code, "locale": "zh-CN"},
+        )
+        verify_owner()
+        data = body.get("data")
+        if (
+            not isinstance(data, dict) or not isinstance(data.get("task_list"), list)
+            or type(data.get("has_more")) is not bool
+            or data["has_more"] and (
+                not isinstance(data.get("page_token"), str) or not data["page_token"]
+                or data["page_token"] == page_token
+            )
+        ):
+            raise FeishuError("invalid_external_approval_tasks")
+        return data
 
     def approve_task(self, instance_code: str, task_id: str, comment: str):
         # Refresh before sending. Never retry a write, including an ambiguous
