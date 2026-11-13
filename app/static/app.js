@@ -109,10 +109,10 @@ async function refreshStatus() {
   $("connection-description").textContent = !s.configured ? "请在 .env 填写 App ID 和 App Secret，然后重启应用。" : s.account ? `已连接 ${s.account.name}。${s.account.can_refresh ? "授权令牌将自动刷新。" : "未获得离线授权，令牌到期后需要重新连接。"}` : "应用凭证已配置，点击右上角连接飞书完成用户授权。";
   const info = $("connection-info");
   info.replaceChildren(el("dt", "接入方式"), el("dd", "WebSocket 长连接 + 设备授权"), el("dt", "工作模式"), el("dd", s.reminders_only ? "仅及时提醒：普通与历史消息同步已停用。" : `每 ${s.sync_interval_seconds} 秒安排普通同步；当前排队 ${s.queued_syncs} 项。`));
-  const workerLabels = { events: "事件连接", sync: s.reminders_only ? "审批与 DMS 提醒读取" : "数据同步", mentions: "@ 我的消息检查", subscriptions: "个人审批订阅", approval_review: "审批自动核验", approval_model: "审批模型", attention: "待处理事项电话提醒", status_notifications: "即时状态私信" };
+  const workerLabels = { events: "事件连接", sync: s.reminders_only ? "审批与 DMS 提醒读取" : "数据同步", mentions: "@ 我的消息检查", subscriptions: "个人审批订阅", approval_review: "审批自动核验", approval_model: "审批模型", attention: "待处理事项电话提醒", status_notifications: "即时状态私信", dms_details: "DMS 详情与风险" };
   const workerStates = { connected: "在线", connecting: "连接中", reconnecting: "正在重连", remote_connection_busy: "该应用已有其他长连接，请先停止其他接收进程", waiting_authorization: "等待账号授权", not_configured: "等待应用凭证", subscribed: "用户订阅注册成功", syncing: "同步中", running: "核验运行中", ready: "本机运行环境就绪", disabled: "未启用", idle: "等待下一轮", blocked_permission: "等待应用权限开通", error: "需要检查", stopped: "已停止" };
   for (const worker of s.workers) {
-    const label = worker.name === "mentions" ? ({ blocked_permission: "等待消息搜索授权：search:message", running: "新 @ 消息同步中", synced: "近期 @ 消息已同步", partial: "搜索结果不完整，等待复查" }[worker.status] || workerStates[worker.status] || worker.status) : worker.name === "approval_model" ? modelRuntimeLabel(worker) : worker.name === "attention" && worker.status === "running" ? "监控运行中" : workerStates[worker.status] || worker.status;
+    const label = worker.name === "mentions" ? ({ blocked_permission: "等待消息搜索授权：search:message", running: "新 @ 消息同步中", synced: "近期 @ 消息已同步", partial: "搜索结果不完整，等待复查" }[worker.status] || workerStates[worker.status] || worker.status) : worker.name === "dms_details" ? ({ ready: "最近一次详情核验完成", unavailable: "详情未取得，按高危待核查", discarded: "来源已变化，等待重新核验" }[worker.status] || workerStates[worker.status] || worker.status) : worker.name === "approval_model" ? modelRuntimeLabel(worker) : worker.name === "attention" && worker.status === "running" ? "监控运行中" : workerStates[worker.status] || worker.status;
     info.append(el("dt", workerLabels[worker.name] || worker.name), el("dd", `${worker.stale ? "进程心跳超时" : label}${worker.error_code ? `（${worker.error_code}）` : ""}`));
   }
   if (s.account) info.append(el("dt", "账号标识"), el("dd", s.account.open_id), el("dt", "当前令牌到期时间"), el("dd", date(s.account.expires_at)));
@@ -555,6 +555,34 @@ function attentionBadge(item) {
   const label = labels[item.status] || attentionStatuses[item.status];
   return el("span", label || "状态待确认", `review-badge ${tone}`);
 }
+function dmsRiskLabel(review) {
+  if (review.status === "pending") return "正在调取详情，风险待判断";
+  const missing = Array.isArray(review.missing_evidence) && review.missing_evidence.length;
+  if (review.status === "ready" && review.risk === "low" && !missing) return "低危";
+  return review.status !== "ready" || missing ? "高危（信息不足，待核查）" : "高危";
+}
+function dmsReviewContent(review) {
+  const section = el("section", undefined, "attention-judgment");
+  section.append(el("h3", "DMS 详情与风险"));
+  const label = dmsRiskLabel(review);
+  section.append(el("p", label, `review-badge ${label === "低危" ? "success" : review.status === "pending" ? "neutral" : "attention"}`));
+  if (review.status === "pending") return section;
+  if (typeof review.summary === "string") section.append(el("p", review.summary, "model-summary"));
+  const labels = ["工单号", "工单类型", "申请人", "环境", "数据库", "目标表", "变更对象", "变更类型", "预计影响行数", "系统校验行数", "回滚", "预检", "授权权限", "授权范围", "授权时长"];
+  if (review.facts && typeof review.facts === "object") {
+    const facts = labels.filter(key => typeof review.facts[key] === "string" && review.facts[key]).map(key => [key, review.facts[key]]);
+    if (facts.length) section.append(fieldList(facts));
+  }
+  for (const [heading, values] of [["判断依据", review.reasons], ["待核查信息", review.missing_evidence]]) {
+    if (!Array.isArray(values) || !values.length) continue;
+    section.append(el("h3", heading));
+    const list = el("ul", undefined, "review-reasons");
+    for (const value of values) if (typeof value === "string") list.append(el("li", value));
+    section.append(list);
+  }
+  if (review.fetched_at) section.append(el("p", `详情读取时间：${date(review.fetched_at)}`, "muted"));
+  return section;
+}
 function attentionContent(item) {
   const approval = item.source_type === "approval";
   const dms = item.source_type === "dms_card";
@@ -575,6 +603,7 @@ function attentionContent(item) {
   if (item.acknowledged_at) fields.push([taskReminder ? "停止提醒时间" : "标记处理时间", date(item.acknowledged_at)]);
   if (item.error_code) fields.push(["错误代码", item.error_code]);
   content.append(fieldList(fields));
+  if (dms && item.dms_review && typeof item.dms_review === "object") content.append(dmsReviewContent(item.dms_review));
   const model = item.model_result;
   if (model) {
     const section = el("section", undefined, "attention-judgment");
@@ -677,7 +706,8 @@ async function loadAttention() {
     const description = el("span", undefined, "attention-record-title");
     const approval = item.source_type === "approval";
     const dms = item.source_type === "dms_card";
-    description.append(el("span", `${dms ? "DMS 审批" : approval ? "审批介入" : "@ 消息"} · ${item.chat_name || (approval || dms ? "待处理审批" : "来自飞书")}`, "attention-chat"), el("span", item.model_result?.summary || item.text || "查看提醒详情", "attention-preview"));
+    const preview = dms && item.dms_review ? `${dmsRiskLabel(item.dms_review)} · ${item.dms_review.summary || "等待工单详情"}` : item.model_result?.summary || item.text || "查看提醒详情";
+    description.append(el("span", `${dms ? "DMS 审批" : approval ? "审批介入" : "@ 消息"} · ${item.chat_name || (approval || dms ? "待处理审批" : "来自飞书")}`, "attention-chat"), el("span", preview, "attention-preview"));
     summary.append(attentionBadge(item), description, el("time", item.source_created_at ? `${approval || dms ? "开始等待 " : ""}${date(item.source_created_at)}` : "时间待确认", "muted"));
     row.append(summary, attentionContent(item));
     rows.push(row);

@@ -22,6 +22,7 @@ from app.attention import AttentionService, attention_view
 from app.config import Settings
 from app.db import DatabaseNotReady, check_database, make_database, wait_for_database
 from app.device_auth import DeviceAuthService
+from app.dms_review import attention_review
 from app.errors import AppError
 from app.feishu import FeishuClient
 from app.model_review import ModelReviewService, business_snapshot
@@ -302,6 +303,7 @@ def create_app(settings=None, *, transport=None):
                     "quiet_hours": False,
                     "approval_intervention_enabled": settings.attention_enabled,
                     "dms_card_supported": attention.dms.configured,
+                    "dms_details_enabled": settings.dms_details_enabled,
                     "model": settings.approval_model,
                     "reasoning_effort": settings.approval_model_reasoning_effort,
                     "buzz_supported": False,
@@ -528,7 +530,9 @@ def create_app(settings=None, *, transport=None):
                 .order_by(MessageAttention.updated_at.desc(), MessageAttention.message_id)
                 .offset(offset).limit(limit + 1)
             ))
-            return page(rows, limit, attention_view)
+            return page(rows, limit, lambda row: {
+                **attention_view(row), "dms_review": attention_review(db, settings, row),
+            })
 
     @app.post("/api/attention/{message_id}/ack", dependencies=[Depends(mutation)])
     def attention_ack(message_id: str):

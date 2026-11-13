@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 FORMAT_VERSION = 1
 # Public Feishu approval app ID from the documented approval AppLink protocol.
 APPROVAL_APP_ID = "cli_9cb844403dbb9108"
+DMS_FACT_LABELS = ("工单号", "工单类型", "申请人", "环境", "数据库", "目标表", "变更对象", "变更类型", "预计影响行数", "系统校验行数", "回滚", "预检", "授权权限", "授权范围", "授权时长")
 
 
 def _display(value, limit):
@@ -83,7 +84,41 @@ def dms_title(source, old_title=""):
     return f"DMS {kind or '审批'} #{identifier}" if identifier else f"DMS {kind or '审批'}"
 
 
-def attach_card(notice, *, title, status, detail="", button=None):
+def dms_review_lines(review):
+    """Only the review's bounded summary fields are suitable for an owner card."""
+    if not isinstance(review, dict) or not review:
+        return []
+    if review.get("status") == "pending":
+        return ["详情：正在调取 DMS 工单详情，风险待判断。"]
+
+    missing = review.get("missing_evidence")
+    missing = missing if isinstance(missing, list) else []
+    low = review.get("status") == "ready" and review.get("risk") == "low" and not missing
+    unavailable = review.get("status") != "ready" or bool(missing)
+    risk = "低危" if low else "高危（信息不足，待核查）" if unavailable else "高危"
+    lines = [f"风险判断：{risk}"]
+    if summary := _display(review.get("summary"), 300):
+        lines.append(f"详情概要：{summary}")
+    facts = review.get("facts")
+    if isinstance(facts, dict):
+        selected = [f"{key}：{value}" for key in DMS_FACT_LABELS if (value := _display(facts.get(key), 100))]
+        # Keep the card scannable while retaining each available key fact.
+        for start in range(0, len(selected), 3):
+            lines.append(" · ".join(selected[start:start + 3]))
+    for label, values in (("判断依据", review.get("reasons")), ("待核查", missing)):
+        if isinstance(values, list):
+            selected = list(dict.fromkeys(text for value in values if (text := _display(value, 160))))[:3]
+            if selected:
+                lines.append(label + "：" + "；".join(selected))
+    return lines
+
+
+def _review_lines(facts):
+    values = facts.get("review_lines")
+    return [_display(value, 600) for value in values[:9] if _display(value, 600)] if isinstance(values, list) else []
+
+
+def attach_card(notice, *, title, status, detail="", button=None, review_lines=None):
     if notice is None:
         return None
     facts = {"title": _display(title, 80), "status": _display(status, 80)}
@@ -91,6 +126,8 @@ def attach_card(notice, *, title, status, detail="", button=None):
         facts["detail"] = detail
     if button:
         facts["button"] = button
+    if review_lines:
+        facts["review_lines"] = _review_lines({"review_lines": review_lines})
     # The existing revision intentionally fingerprints only the legacy semantic
     # projection. A layout change must not re-announce historical sources.
     return {**notice, "card": facts}
@@ -132,6 +169,7 @@ def compact_text(payload):
     lines = [_display(facts.get("title"), 80), _display(facts.get("status"), 80)]
     if detail := brief_reason(facts.get("detail")):
         lines.append(detail)
+    lines.extend(_review_lines(facts))
     return "\n".join(line for line in lines if line)
 
 
@@ -165,6 +203,7 @@ def status_card(payload):
     elements = [{"tag": "div", "text": {"tag": "plain_text", "content": _display(facts.get("status"), 80)}}]
     if detail := brief_reason(facts.get("detail")):
         elements.append({"tag": "div", "text": {"tag": "plain_text", "content": detail}})
+    elements.extend({"tag": "div", "text": {"tag": "plain_text", "content": line}} for line in _review_lines(facts))
     button = facts.get("button")
     if isinstance(button, dict) and _valid_url(button.get("url"), button.get("label")):
         links = {"url": button["url"]}

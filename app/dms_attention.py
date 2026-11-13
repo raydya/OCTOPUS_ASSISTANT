@@ -138,6 +138,7 @@ def _parse(raw):
         ):
             card["error"] = "dms_card_link_unverified"
             return card
+        card["source_url"] = links["url"]
         buttons = _button_labels(body.get("elements"))
         card["buttons"] = buttons
         if len(buttons) == 2 and set(buttons) == {"同意", "拒绝"}:

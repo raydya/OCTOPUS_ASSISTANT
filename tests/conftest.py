@@ -33,6 +33,7 @@ def settings(tmp_path):
         approval_policy_path=str(policy),
         approval_model_enabled=False,
         attention_enabled=False,
+        dms_details_enabled=False,
     )
 
 

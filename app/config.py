@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     attention_call_cooldown_seconds: int = Field(default=1800, ge=300, le=86400)
     dms_sender_app_id: str = ""
     dms_chat_id: str = ""
+    dms_details_enabled: bool = True
+    dms_details_url: str = "http://host.docker.internal:8182"
+    dms_details_token_file: str = ".data/dms-token"
+    dms_details_timeout_seconds: float = Field(default=60, ge=1, le=120)
 
     @model_validator(mode="after")
     def validate_settings(self):

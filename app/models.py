@@ -260,6 +260,21 @@ class MessageAttention(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class DmsReview(Base):
+    __tablename__ = "dms_reviews"
+    source_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    owner_open_id: Mapped[str] = mapped_column(String(128), index=True)
+    source_message_id: Mapped[str] = mapped_column(String(128))
+    task_key: Mapped[str] = mapped_column(String(200))
+    source_hash: Mapped[str] = mapped_column(String(64))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class StatusNotificationState(Base):
     __tablename__ = "status_notification_states"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

@@ -28,6 +28,10 @@ x-runtime-environment: &runtime-environment
   ATTENTION_CALL_COOLDOWN_SECONDS: ${ATTENTION_CALL_COOLDOWN_SECONDS:-1800}
   DMS_SENDER_APP_ID: ${DMS_SENDER_APP_ID:-}
   DMS_CHAT_ID: ${DMS_CHAT_ID:-}
+  DMS_DETAILS_ENABLED: ${DMS_DETAILS_ENABLED:-true}
+  DMS_DETAILS_URL: ${DMS_DETAILS_URL:-http://host.docker.internal:8182}
+  DMS_DETAILS_TOKEN_FILE: /run/secrets/dms-token
+  DMS_DETAILS_TIMEOUT_SECONDS: ${DMS_DETAILS_TIMEOUT_SECONDS:-60}
 
 services:
   app:
@@ -58,6 +62,12 @@ services:
       - type: bind
         source: ./.data/model-token
         target: /run/secrets/model-token
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./.data/dms-token
+        target: /run/secrets/dms-token
         read_only: true
         bind:
           create_host_path: false

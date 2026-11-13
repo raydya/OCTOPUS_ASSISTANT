@@ -19,6 +19,8 @@ from app.attention import AttentionService
 from app.attention_model import MessageImportanceClient
 from app.config import Settings
 from app.db import make_database, wait_for_database
+from app.dms_client import DmsDetailClient
+from app.dms_review import DmsReviewService
 from app.errors import AppError, FeishuError
 from app.events import BackgroundSync, EventInboxHandler, worker_status
 from app.feishu import FeishuClient
@@ -128,6 +130,8 @@ async def run(settings):
     status_http = FeishuClient(settings, security, sessions)
     mentions_http = FeishuClient(settings, security, sessions)
     notifications = StatusNotificationService(settings, sessions, status_http)
+    dms_client = DmsDetailClient(settings)
+    dms_reviews = DmsReviewService(settings, sessions, dms_client)
     attention_model = MessageImportanceClient(settings) if settings.attention_enabled else None
     attention = AttentionService(settings, sessions, attention_http, attention_model)
     model_client = ApprovalModelClient(settings) if settings.approval_model_enabled else None
@@ -237,7 +241,23 @@ async def run(settings):
             except TimeoutError:
                 pass
 
+    async def review_dms():
+        while not stopping.is_set():
+            try:
+                if settings.dms_details_enabled:
+                    result = await asyncio.to_thread(dms_reviews.tick)
+                    worker_status(sessions, "dms_details", (result or {}).get("status", "running"))
+                else:
+                    worker_status(sessions, "dms_details", "disabled")
+            except Exception:
+                worker_status(sessions, "dms_details", "error", "dms_details_unavailable")
+            try:
+                await asyncio.wait_for(stopping.wait(), timeout=3)
+            except TimeoutError:
+                pass
+
     reconcile_task = asyncio.create_task(reconcile())
+    dms_task = asyncio.create_task(review_dms())
     mentions_task = asyncio.create_task(poll_mentions(settings, sessions, mentions, stopping))
     approval_task = asyncio.create_task(review_approvals())
     attention_task = asyncio.create_task(check_attention())
@@ -300,6 +320,7 @@ async def run(settings):
         await approval_task
         await attention_task
         await status_task
+        await dms_task
         await socket._disconnect()
         remaining = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         for task in remaining:
@@ -313,6 +334,7 @@ async def run(settings):
         attention_http.close()
         status_http.close()
         mentions_http.close()
+        dms_client.close()
         if attention_model:
             attention_model.close()
         if model_client:

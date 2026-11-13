@@ -14,6 +14,10 @@ uv sync --frozen
 .venv/bin/python scripts/setup_model.py
 # macOS: install a background service that starts on user login.
 .venv/bin/python scripts/model_service.py install
+# DMS reader token is mounted by the worker; prepare it even if DMS is disabled.
+.venv/bin/python scripts/dms_service.py prepare
+# With an existing Alibaba Cloud CLI login, enable the independent DMS reader:
+.venv/bin/python scripts/dms_service.py install
 # Other systems: keep this running with your service manager:
 # .venv/bin/python -m app.codex_host
 # Configure DATABASE_URL and MIGRATION_DATABASE_URL, then start local-infra first.
@@ -35,6 +39,7 @@ docker compose up -d --build app worker
 | `worker` | 连接飞书 WSS、读取提醒来源、调用模型判断待办并执行已满足条件的审批，对超时未响应的待处理事项发起电话提醒；使用同一运行账号 |
 | `migrate` | maintenance profile 下的一次性 Alembic 迁移；仅使用本应用 owner 账号 |
 | 宿主机 `app.codex_host` | 在本机独立运行 Codex 模型服务，复用 ChatGPT 登录，每次请求创建隔离的临时线程 |
+| 宿主机 `app.dms_host` | 使用本机阿里云 CLI 登录，只读获取 DMS 工单详情，供 worker 生成概要与风险结论 |
 
 共享 PostgreSQL 使用外部内部网络 `local-infra-assistant-db`，服务地址为 `shared-postgres:5432`。本应用独占数据库 `octopus_assistant`，不与 Codex bot 共用数据库或账号。`local-infra` 必须先创建该网络、数据库和权限。
 
@@ -134,7 +139,7 @@ macOS 可用 `scripts/model_service.py install` 注册独立的当前用户 Laun
 
 ## 待处理事项电话提醒
 
-`STATUS_NOTIFICATIONS_ENABLED=true` 时，独立后台循环在读取到新审批、DMS 待办或明确 @ 本人的消息后，直接用机器人给绑定账号本人发一张状态卡片，无需等待 15 分钟。同一事项的后续状态更新原卡片，不逐条发新私信。卡片只显示事项名称、当前状态和查看入口；需要本人介入或发生异常时，最多补一句问题或原因。例如 DMS 显示“权限申请 #28562578 / 正在核验”，随后更新为“待你审批”或“已通过”。审批只有回读确认后才称已通过，模型建议、提交中和结果未确认分别展示。DMS 只汇报卡片状态，不自动审批。原生审批可直接打开申请，DMS 和 @ 消息打开原会话。
+`STATUS_NOTIFICATIONS_ENABLED=true` 时，独立后台循环在读取到新审批、DMS 待办或明确 @ 本人的消息后，直接用机器人给绑定账号本人发一张状态卡片，无需等待 15 分钟。同一事项的后续状态更新原卡片，不逐条发新私信。普通事项显示名称、当前状态和查看入口；DMS 待办还会展示工单详情概要、高危或低危结论和具体依据。审批只有回读确认后才称已通过，模型建议、提交中和结果未确认分别展示。DMS 风险判断不执行审批。原生审批可直接打开申请，已核实的 DMS 详情可打开原工单，其余 DMS 和 @ 消息打开原会话。
 
 本人在飞书手动处理审批后，后台核对同一实例、同一任务和本人的明确结果，并更新原卡片为“已通过”“已拒绝”“已转交”或“本人节点已结束”。待办消失或整个流程结束不等于本人同意；本人节点通过也不代表整个流程已结束。手动处理的结果只用于状态展示，不伪造应用提交记录。
 
@@ -155,6 +160,21 @@ macOS 可用 `scripts/model_service.py install` 注册独立的当前用户 Laun
 **重要 @ 消息**：后台从首次启用时间起观察已同步会话中**明确 @ 本人**的新消息，调用模型判断是否重要且需要本人及时响应。到期后实时核对原消息、本人已读状态和后续会话，原消息所属话题内的回复也会单独核验。已读、本人在该会话后续发言或工作台点击“已处理”，都会停止升级；“已读”仅作为避免打扰的响应信号，不代表事项已完成。未知已读状态、分页未查全、消息变化或核验失败均不会触发电话。模型判断与电话执行独立，模型没有发信或呼叫工具。
 
 **DBA DMS 卡片**：用 `DMS_SENDER_APP_ID` 和 `DMS_CHAT_ID` 固定可信 DBA 机器人及本人私聊，后台优先同步该会话。明确待处理的卡片从首次发现开始等待 15 分钟；当前仅支持可用的“同意 / 拒绝”按钮组合，不调用模型决定是否通过，不点击按钮或调用 DMS 审批接口。发送提醒前和拨号前都会重新读取原卡片。已完成、已撤销或本人点击“停止本次提醒”会停止提醒；已读和聊天回复不表示审批完成。同一 DMS 任务的重复通知不会重置等待或导致重拨，未提交的提醒在服务重启后保留。卡片模板或状态无法确认时保留待核查记录，不触发电话；处理状态以飞书可读取的 DBA 卡片为依据。
+
+**DMS 详情与风险**：`DMS_DETAILS_ENABLED=true` 时，独立循环通过本机阿里云 CLI 读取工单基础信息，按类型读取普通变更、权限申请或数据导出详情；普通变更继续分页读取 SQL 预检信息。飞书原状态卡片和工作台提醒详情展示申请人、数据库/环境、变更类型、预计影响行数、回滚/预检情况、风险及理由。只保存概要和结论，不持久化原始 SQL。查询失败、身份无法核实、分页不完整、SQL 附件尚未读取或关键证据不足，明确显示“高危（信息不足，待核查）”；查询中显示风险待判断。
+
+风险采用可解释的保守规则：生产影响、DDL/删除、权限授权、数据导出或超出影响行数阈值为高危。低危仅适用于证据完整的普通变更：全部目标明确为开发/测试环境，单条带明确等值条件的有限 UPDATE，最多影响 100 行，存在匹配的回滚语句，并通过完整预检。复杂 SQL 不自动降级。卡片链接需包含与标题一致的 `orderId`、`ticketId`，或官方 `/console/mobile/index/` 路径中的 `pid`，且 API 回读同一工单；支持“数据变更”和“Data Correct”卡片标题。只有 `taskId` 的旧模板会读取候选工单，但保留“身份映射未核实”的缺证结论。新卡片版本立即作废旧结论，结果写入前再次核对账号和卡片；待办详情每五分钟刷新，超过五分钟的旧结论不再展示，失败按退避重试。风险不会改变电话期限或触发 DMS 同意/拒绝。
+
+本机详情服务与 Codex 推理服务独立，使用已有 `aliyun` 插件版 CLI（`aliyun dms-enterprise get-order-base-info --help` 可验证）及其 OAuth 登录；阿里云凭证不进入 Docker 或模型进程。服务只监听 `127.0.0.1:8182`，只接受令牌鉴权的工单编号，内部调用固定 Get/List 白名单，不接受任意 URL、CLI 命令或 SQL 执行请求。部署前执行：
+
+```bash
+.venv/bin/python scripts/dms_service.py prepare
+.venv/bin/python scripts/dms_service.py install --profile company-cli-user
+docker compose --profile maintenance run --rm migrate
+docker compose up -d --build app worker
+```
+
+`prepare` 创建 `.data/dms-token`，Docker worker 只读挂载；`install` 在 macOS 注册独立登录服务，可用 `status` / `stop` 查看或停止。其他系统先 `prepare`，再以服务管理器运行 `python -m app.dms_host`，并配置容器能访问的本机地址。`DMS_DETAILS_URL` 只接受本机/`host.docker.internal` 地址；服务未启动、CLI 未登录或无工单权限时，仍保留原审批提醒并明确展示详情缺失。升级需迁移至 `0011`，暂停详情查询可设置 `DMS_DETAILS_ENABLED=false`。
 
 触发时，应用机器人先单聊给**绑定账号本人**发送提醒，再对这条机器人消息调用飞书电话加急，电话打到飞书绑定手机号。接口要求只能加急机器人自己发送的消息，所以不会直接加急别人发来的原消息。电话提醒消耗企业短信/电话加急额度；机器人会话被折叠等飞书端条件可能影响实际触达。[官方电话加急说明](https://open.feishu.cn/document/server-docs/im-v1/buzz-messages/urgent_phone)
 

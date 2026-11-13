@@ -19,6 +19,7 @@ from app.status_cards import (
     brief_reason,
     chat_button,
     dms_button,
+    dms_review_lines,
     dms_title,
 )
 from app.status_cards import card_fingerprint as card_fingerprint
@@ -97,17 +98,20 @@ def dms_receipt_revision(source_id):
 
 
 def dms_received_notice(payload, *, base_url="", chat_id=""):
+    projected = _mapping(payload.get("card"))
+    review_lines = projected.get("review_lines") or []
     notice = _notice("dms_card", payload["source_id"], "received", payload["title"], [
         "当前状态：已收到，系统已登记这条 DMS 审批。",
+        *review_lines,
         "下一步：核对原卡片状态，并汇报是否仍需你处理。",
         "处理范围：系统只核验状态和提醒，由你在原卡片完成审批。",
         *_links(base_url, chat_id),
     ])
     notice["revision"] = dms_receipt_revision(payload["source_id"])
-    projected = _mapping(payload.get("card"))
     return attach_card(
         notice, title=projected.get("title") or dms_title({}, payload["title"]),
         status="⏳ 正在核验", button=projected.get("button") or chat_button(chat_id),
+        review_lines=review_lines,
     )
 
 
@@ -374,6 +378,8 @@ def attention_notice(row, *, base_url="", source_url=""):
     status = _get(row, "status")
     model = _mapping(_get(row, "model_result"))
     source = _mapping(_get(row, "source_data"))
+    dms_review = _mapping(_get(row, "dms_review")) if dms else {}
+    review_lines = dms_review_lines(dms_review)
     if not dms and status in {"queued", "assessing"} and not _get(row, "acknowledged_at"):
         return _message_received(
             _get(row, "message_id"), _get(row, "chat_name"), _get(row, "text"),
@@ -458,6 +464,7 @@ def attention_notice(row, *, base_url="", source_url=""):
         if reasons := _items(_get(row, "reasons", []), 2):
             lines.append("核验说明：" + "；".join(reasons))
     if dms:
+        lines.extend(review_lines)
         lines.append("处理边界：仅提醒，不自动审批 DMS。")
     lines.extend([f"下一步：{next_step}", *_links(base_url, _get(row, "chat_id"))])
     notice = _notice(source_type, _get(row, "message_id"), phase, title, lines, terminal=terminal)
@@ -493,5 +500,6 @@ def attention_notice(row, *, base_url="", source_url=""):
         notice,
         title=dms_title(source, title) if dms else "@ 我 · " + (_short(_get(row, "chat_name"), 160) or "飞书会话"),
         status=display_status, detail=detail,
-        button=dms_button(source_url, _get(row, "chat_id")) if dms else chat_button(_get(row, "chat_id")),
+        button=dms_button(source_url or dms_review.get("source_url"), _get(row, "chat_id")) if dms else chat_button(_get(row, "chat_id")),
+        review_lines=review_lines,
     )

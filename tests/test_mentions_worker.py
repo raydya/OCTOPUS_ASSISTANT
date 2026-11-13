@@ -81,12 +81,15 @@ def test_worker_mentions_run_during_blocked_history_and_drain_before_close(monke
         monkeypatch.setattr(worker, "ApprovalReviewer", lambda *args, **kwargs: object())
         monkeypatch.setattr(worker, "AttentionService", lambda *args: object())
         monkeypatch.setattr(worker, "StatusNotificationService", lambda *args: object())
+        monkeypatch.setattr(worker, "DmsDetailClient", Client)
+        monkeypatch.setattr(worker, "DmsReviewService", lambda *args: object())
         monkeypatch.setattr(worker, "worker_status", lambda *args, **kwargs: statuses.append((args, kwargs)))
         monkeypatch.setattr(worker.loop, "add_signal_handler", lambda sig, callback: callbacks.setdefault(sig, callback))
         settings = SimpleNamespace(
             database_wait_seconds=1, sync_interval_seconds=60,
             approval_model_enabled=False, approval_automation_enabled=False,
             attention_enabled=False, status_notifications_enabled=False,
+            dms_details_enabled=False,
         )
         failures = []
 

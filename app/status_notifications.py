@@ -23,6 +23,7 @@ from app.dms_attention import (
     _presentation,
     dms_attention_id,
 )
+from app.dms_review import review_view as dms_review_view
 from app.errors import AppError
 from app.external_approval import SOURCE as EXTERNAL_COMPLETION_SOURCE
 from app.external_approval import personal_handled_result
@@ -217,6 +218,7 @@ class StatusNotificationService:
             message_id=identifier, source_type="dms_card", chat_id=chat.chat_id,
             status=status, acknowledged_at=None, source_data=_metadata(card, self.dms.app_id, chat.chat_id),
             model_result=_presentation(card), reasons=[], text=card["task_key"],
+            dms_review=dms_review_view(db, self.settings, owner, identifier, card),
         )
         result = attention_notice(view, base_url=self.settings.app_base_url)
         result["origin_message_id"] = card["message_id"]
@@ -241,6 +243,7 @@ class StatusNotificationService:
         card = self.dms._latest(db, account, chat, card)
         # Project a copy: status DMs must never mutate the phone reminder state.
         view = SimpleNamespace(**{column.name: getattr(row, column.name) for column in MessageAttention.__table__.columns})
+        view.dms_review = dms_review_view(db, self.settings, owner, row.message_id, card) if not row.acknowledged_at else None
         if not row.acknowledged_at:
             if card["status"] in TERMINAL:
                 view.status = "responded"
